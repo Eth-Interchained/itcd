@@ -293,7 +293,15 @@ bool CBlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, 
                 } else {
                     powHash = pindexNew->GetBlockHash();
                 }
-                int64_t prevBlockTime = pindexNew->pprev ? pindexNew->pprev->nTime : -1;
+                // During index load, pprev may be a freshly-inserted stub whose
+                // nTime hasn't been populated from disk yet (LevelDB iterates
+                // in hash order, not height order). Treat an unloaded stub
+                // (nTime == 0) the same as a missing prev: pass -1 sentinel
+                // for permissive emergency-arming, matching every other call
+                // site that lacks a real previous-block timestamp.
+                int64_t prevBlockTime = (pindexNew->pprev && pindexNew->pprev->nTime != 0)
+                                          ? pindexNew->pprev->nTime
+                                          : -1;
                 if (!CheckProofOfWork(powHash, dummyHeader, pindexNew->nBits, consensusParams, pindexNew->nHeight, prevBlockTime)) {
                     return error("%s: CheckProofOfWork failed: %s", __func__, pindexNew->ToString());
                 }

@@ -77,7 +77,14 @@ public:
         // between a block and its parent exceeds nPowEmergencyTimeout.
         consensus.sha256ReactivationHeight = 571799;
         // 120 seconds = 4x the 30s target spacing.
-        consensus.nPowEmergencyTimeout = 180;
+        consensus.nPowEmergencyTimeout = 120;
+        // Transition grace: Yespower is accepted at any cadence for the
+        // first 4032 post-reactivation blocks (~33h at 30s spacing, more
+        // at the slower transitional cadence). This absorbs the algorithm
+        // handoff and lets the chain converge with any pre-existing
+        // Yespower-pool fork that mined past 571799 before this binary
+        // shipped. After grace, Yespower is emergency-only.
+        consensus.nPowYespowerGraceBlocks = 4032;
         consensus.difficultyForkHeight = std::numeric_limits<int>::max();
         consensus.nextDifficultyForkHeight = 1;
         consensus.nextDifficultyFork2Height = 1;
