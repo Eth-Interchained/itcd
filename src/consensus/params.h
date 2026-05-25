@@ -58,29 +58,29 @@ struct Params {
     int yespowerForkHeight;
     int sha256ForkHeight;
     /**
-     * Height at which the live chain forks BACK to SHA256 as the main PoW.
-     * Distinct from `sha256ForkHeight` (which is historical / pre-existing).
+     * Height at which SHA256 becomes the primary PoW for this network.
+     * Distinct from `sha256ForkHeight`, which is a separate, pre-existing
+     * field left untouched.
      *
-     * Pre-sha256ReactivationHeight: Yespower remains the main PoW
-     *   (historical Yespower blocks stay valid forever).
-     * At/after sha256ReactivationHeight: SHA256 is the main PoW. Yespower
-     *   is allowed only as an emergency fallback when difficulty drops
-     *   below 1 (encoded target easier than the SHA256 powLimit).
+     * Pre-sha256ReactivationHeight: Yespower is the primary PoW.
+     * At/after sha256ReactivationHeight: SHA256 is always accepted.
+     *   Yespower is additionally accepted on a per-block basis when the
+     *   time-based emergency trigger (see `nPowEmergencyTimeout`) is armed.
      *
-     * Use std::numeric_limits<int>::max() to disable on networks that
-     * should not fork back.
+     * Defaults to `std::numeric_limits<int>::max()` so any network that
+     * does not explicitly set this field never activates the fork.
      */
     int sha256ReactivationHeight{std::numeric_limits<int>::max()};
     /**
-     * Post-reactivation emergency timeout (seconds). If the candidate
-     * block's nTime exceeds the previous block's nTime by more than this
-     * value, the Yespower fallback is armed for that block (a Yespower
-     * solution is accepted in addition to SHA256). 0 disables the
-     * fallback entirely (SHA256-only post-fork).
+     * Post-reactivation emergency-fallback threshold, in seconds.
      *
-     * Trigger is purely time-based because once SHA256 ASICs lock the
-     * chain, difficulty will never naturally slide low enough for a
-     * target-based trigger to fire.
+     * For a candidate block at height >= sha256ReactivationHeight, the
+     * Yespower fallback is armed when
+     *     (block.nTime - prevBlock.nTime) > nPowEmergencyTimeout.
+     * When armed, a Yespower solution is accepted in addition to SHA256.
+     * SHA256 is always accepted regardless of arming.
+     *
+     * 0 disables the fallback entirely (SHA256-only post-reactivation).
      */
     int64_t nPowEmergencyTimeout{0};
     int difficultyForkHeight;
