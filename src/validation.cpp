@@ -1164,15 +1164,20 @@ static bool WriteBlockToDisk(const CBlock& block, FlatFilePos& pos, const CMessa
     catch (const std::exception& e) {
         return error("%s: Deserialize or I/O error - %s at %s", __func__, e.what(), pos.ToString());
     }
+    // Dual-PoW hash selection (see CheckBlockHeader for the rationale).
     uint256 hash;
     if (nHeight == 0) {
         hash = block.GetHash(); // force legacy SHA256
+    } else if (nHeight >= consensusParams.sha256ReactivationHeight) {
+        hash = block.GetHash(); // SHA256 (dual-PoW path)
     } else if (nHeight >= 1) {
         hash = YespowerHash(block, nHeight);
     } else {
         hash = block.GetHash(); // Legacy SHA256
     }
-    // Check the header
+    // Check the header. prevBlockTime defaults to -1 (permissive) since
+    // this path doesn't have pindexPrev handy; blocks reaching disk reload
+    // were already validated at acceptance time.
     if (!CheckProofOfWork(hash, block, block.nBits, consensusParams, nHeight))
         return error("ReadBlockFromDisk: Errors in block header at %s", pos.ToString());
 
@@ -3427,9 +3432,17 @@ static bool FindUndoPos(BlockValidationState &state, int nFile, FlatFilePos &pos
 
 static bool CheckBlockHeader(const CBlockHeader& block, BlockValidationState& state, const Consensus::Params& consensusParams, int nHeight, bool fCheckPOW = true, int64_t prevBlockTime = -1)
 {
+    // Dual-PoW hash selection:
+    //   Post-reactivation : SHA256 (the Yespower fallback inside
+    //                       CheckProofOfWork re-hashes internally, so we
+    //                       don't need to precompute YespowerHash here).
+    //   Pre-reactivation  : Yespower (legacy live-chain path).
+    //   Genesis           : SHA256.
     uint256 hash;
     if (nHeight == 0) {
         hash = block.GetHash(); // force legacy SHA256
+    } else if (nHeight >= consensusParams.sha256ReactivationHeight) {
+        hash = block.GetHash(); // SHA256 (dual-PoW path)
     } else if (nHeight >= 1) {
         hash = YespowerHash(block, nHeight);
     } else {

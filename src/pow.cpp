@@ -32,7 +32,8 @@ static inline bool IsPostSha256Fork(int nHeight, const Consensus::Params& params
 }
 
 // The powLimit that applies for difficulty retargeting at a given next-height.
-// Post-fork we target SHA256 difficulty; pre-fork we stay on Yespower.
+// Post-reactivation we target SHA256 difficulty; pre-reactivation we stay
+// on Yespower.
 static inline uint256 GetPowLimitForHeight(int nHeight, const Consensus::Params& params)
 {
     if (IsPostSha256Fork(nHeight, params)) return params.powLimit;
@@ -239,13 +240,14 @@ unsigned int DarkGravityWave3Nova(const CBlockIndex* pindexLast, const Consensus
         newDifficulty = bnPowLimit;
     }
 
-    // Post-fork (SHA256 era) we cap normal retargets at the SHA256 powLimit.
-    // If the chain stalls and the diff would slide below 1 (target > powLimit),
-    // we still allow it up to the Yespower powLimit so Yespower miners can
-    // rescue the chain under the emergency fallback.
+    // Post-reactivation: cap the retarget result at the Yespower powLimit.
+    // SHA256 miners always have diff >= 1 work (the check path clamps the
+    // effective SHA256 target at the SHA256 powLimit); the wider Yespower
+    // limit here just keeps the encoded nBits within a representable band
+    // for any future fallback solution.
     if (IsPostSha256Fork(nextHeight, params)) {
-        arith_uint256 emergencyCap = UintToArith256(params.powLimitYespower);
-        if (newDifficulty > emergencyCap) newDifficulty = emergencyCap;
+        arith_uint256 yespowerCap = UintToArith256(params.powLimitYespower);
+        if (newDifficulty > yespowerCap) newDifficulty = yespowerCap;
     }
 
     LogPrintf("⛏️ Retargeting at height=%d with DGW3-NOVA\n", pindexLast->nHeight);
@@ -308,11 +310,11 @@ unsigned int DarkGravityWave3(const CBlockIndex* pindexLast, const Consensus::Pa
         newDifficulty = bnPowLimit;
     }
 
-    // Same emergency-fallback band as DGW3-NOVA: post-fork we still allow
-    // the target to slide up to powLimitYespower under stall conditions.
+    // Post-reactivation: cap the retarget at the Yespower powLimit
+    // (see matching comment in DarkGravityWave3Nova).
     if (IsPostSha256Fork(nextHeight, params)) {
-        arith_uint256 emergencyCap = UintToArith256(params.powLimitYespower);
-        if (newDifficulty > emergencyCap) newDifficulty = emergencyCap;
+        arith_uint256 yespowerCap = UintToArith256(params.powLimitYespower);
+        if (newDifficulty > yespowerCap) newDifficulty = yespowerCap;
     }
 
     LogPrintf("⛏️ Retargeting at height=%d with DGW3\n", pindexLast->nHeight);
@@ -417,19 +419,15 @@ bool CheckProofOfWorkWithHeight(uint256 hash, CBlockHeader block, unsigned int n
     // -----------------------------------------------------------------------
     // POST-REACTIVATION (height >= sha256ReactivationHeight): dual PoW.
     //
-    //   SHA256 is ALWAYS accepted post-fork. A block is valid if its
-    //   SHA256 hash meets the encoded target (clamped at SHA256 powLimit
-    //   so diff cannot drop below 1 for the SHA256 path). SHA256 miners
-    //   never need to switch algos or be told to "turn off / turn on".
+    //   SHA256 is always accepted. The effective SHA256 target is the
+    //   block's encoded target clamped at the SHA256 powLimit so SHA256
+    //   miners always have diff >= 1 work regardless of nBits.
     //
-    //   Yespower is ADDITIONALLY accepted, but only when the time gap
-    //   between this block's nTime and the previous block's nTime
-    //   exceeds params.nPowEmergencyTimeout seconds (chain has stalled).
-    //   The Yespower target must still fit inside the Yespower powLimit.
-    //
-    //   Trigger is time-based — not target-based — because once SHA256
-    //   ASICs are mashing the chain, difficulty will never naturally
-    //   slide low enough for a target-based trigger to fire.
+    //   Yespower is additionally accepted when the time-based emergency
+    //   trigger is armed for this block:
+    //       (block.nTime - prevBlock.nTime) > nPowEmergencyTimeout.
+    //   The Yespower target is the block's encoded target and must fit
+    //   inside the Yespower powLimit.
     // -----------------------------------------------------------------------
     if (IsPostSha256Fork(nHeight, params)) {
         const arith_uint256 sha256Limit   = UintToArith256(params.powLimit);
@@ -449,7 +447,7 @@ bool CheckProofOfWorkWithHeight(uint256 hash, CBlockHeader block, unsigned int n
 
         // ---- SHA256 path: always available post-fork ----
         // Cap the effective target at the SHA256 powLimit so SHA256 miners
-        // always have diff-≥-1 work, and so emergency-range nBits don't
+        // always have diff >= 1 work, and so emergency-range nBits don't
         // lock SHA256 out.
         {
             arith_uint256 sha256Target = bnTarget;
