@@ -59,6 +59,17 @@ static inline bool IsEmergencyArmed(int64_t blockTime, int64_t prevBlockTime, co
     if (prevBlockTime < 0)                return true;      // unknown -> permissive
     return (blockTime - prevBlockTime) > params.nPowEmergencyTimeout;
 }
+
+// Transition grace window: during the first nPowYespowerGraceBlocks blocks
+// at and after sha256ReactivationHeight, Yespower is accepted unconditionally
+// (no inter-block-time arming required). SHA256 is also accepted throughout.
+// After the window closes, Yespower reverts to emergency-only.
+static inline bool IsYespowerGraceActive(int nHeight, const Consensus::Params& params)
+{
+    if (params.nPowYespowerGraceBlocks <= 0) return false;
+    if (nHeight < params.sha256ReactivationHeight) return false;
+    return nHeight < (params.sha256ReactivationHeight + params.nPowYespowerGraceBlocks);
+}
 // ----------------------------------------------------------------------------
 // BITCOIN LEGACY DAA
 unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader *pblock, const Consensus::Params& params)
@@ -439,12 +450,16 @@ bool CheckProofOfWorkWithHeight(uint256 hash, CBlockHeader block, unsigned int n
             return false;
         }
 
+        const bool grace     = IsYespowerGraceActive(nHeight, params);
         const bool emergency = IsEmergencyArmed((int64_t)block.nTime, prevBlockTime, params);
-        LogPrintf("🔁 Dual-PoW @%d: SHA256 always-on%s (gap=%lds, threshold=%lds)\n",
+        const bool yespowerAllowed = grace || emergency;
+        LogPrintf("🔁 Dual-PoW @%d: SHA256 always-on%s%s (gap=%lds, threshold=%lds, graceEnds=%d)\n",
                   nHeight,
-                  emergency ? " + Yespower fallback (emergency)" : "",
+                  grace     ? " + Yespower (grace window)" : "",
+                  (!grace && emergency) ? " + Yespower (emergency)" : "",
                   (long)(prevBlockTime < 0 ? -1 : (int64_t)block.nTime - prevBlockTime),
-                  (long)params.nPowEmergencyTimeout);
+                  (long)params.nPowEmergencyTimeout,
+                  params.sha256ReactivationHeight + params.nPowYespowerGraceBlocks);
 
         // ---- SHA256 path: always available post-fork ----
         // Cap the effective target at the SHA256 powLimit so SHA256 miners
@@ -459,13 +474,13 @@ bool CheckProofOfWorkWithHeight(uint256 hash, CBlockHeader block, unsigned int n
             }
         }
 
-        // ---- Yespower fallback: only when armed by time-based trigger ----
-        if (emergency) {
-            LogPrintf("🛟 Trying Yespower emergency fallback\n");
+        // ---- Yespower path: open during grace window, or armed via emergency timeout ----
+        if (yespowerAllowed) {
+            LogPrintf("🛟 Trying Yespower (%s)\n", grace ? "grace window" : "emergency fallback");
             return CheckYespower(block, bnTarget, nHeight);
         }
 
-        LogPrintf("📏 SHA256 hash <= target ❌ (Yespower fallback not armed)\n");
+        LogPrintf("📏 SHA256 hash <= target ❌ (Yespower not allowed: no grace, no emergency)\n");
         return false;
     }
 

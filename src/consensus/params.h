@@ -83,6 +83,21 @@ struct Params {
      * 0 disables the fallback entirely (SHA256-only post-reactivation).
      */
     int64_t nPowEmergencyTimeout{0};
+    /**
+     * Transition grace window, in blocks.
+     *
+     * For the first `nPowYespowerGraceBlocks` blocks at and after
+     * `sha256ReactivationHeight`, Yespower is accepted UNCONDITIONALLY
+     * (no `nPowEmergencyTimeout` arming requirement). This lets miners
+     * coordinate the algorithm handoff without the chain cliff-stalling
+     * at the exact activation height. SHA256 is also accepted throughout
+     * the grace window. After the window closes, Yespower reverts to
+     * emergency-only via `nPowEmergencyTimeout`.
+     *
+     * 0 disables the grace window (strict emergency-only from height
+     * `sha256ReactivationHeight` onward).
+     */
+    int nPowYespowerGraceBlocks{0};
     int difficultyForkHeight;
     int nextDifficultyForkHeight;
     int nextDifficultyFork2Height;
