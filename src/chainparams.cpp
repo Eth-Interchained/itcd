@@ -81,7 +81,7 @@ public:
         //                      block's nTime exceeds the previous block's
         //                      nTime by more than nPowEmergencyTimeout
         //                      seconds (chain stalled).
-        consensus.sha256ReactivationHeight = 571999;
+        consensus.sha256ReactivationHeight = 571799;
         // 2 minutes (= 4x the 30s target spacing). If no block has been
         // produced in 2 minutes, the next block may be solved with
         // Yespower as a fallback in addition to SHA256.
