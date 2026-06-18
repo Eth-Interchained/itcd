@@ -1,29 +1,45 @@
 [package]
-name = "nedb-ffi"
-version = "0.1.0"
-edition = "2021"
+name        = "nedb-ffi"
+version     = "0.1.0"
+edition     = "2021"
 description = "C FFI bridge — exposes the NEDB DAG engine to the ITC C++ node (replaces LevelDB)"
-license = "MIT"
+license     = "MIT"
 
 [lib]
-name = "nedb_ffi"
-# staticlib  → links into itcd binary
-# cdylib     → shared .so/.dylib for dynamic linking
+name       = "nedb_ffi"
+# staticlib → links into itcd binary at build time
+# cdylib    → shared .so/.dylib for dynamic linking
 crate-type = ["staticlib", "cdylib"]
 
-[dependencies]
-# Phase 1: HashMap-backed MVP proves the C FFI surface compiles and the CDBWrapper shim works.
-# Phase 2: uncomment the line below to wire in the real NEDB DAG engine (nedb_core_v2::Db).
-# nedb-v2 = { git = "https://github.com/Eth-Interchained/nedb", package = "nedb-v2" }
+# ── Phase 2 feature flag ───────────────────────────────────────────────────
+# Enable with: cargo build --release --features phase2
+#
+# Phase 1 (default): BTreeMap-backed in-process store.
+#   Proves the C FFI surface, CDBWrapper shim, and CI pipeline.
+#   Zero external dependencies beyond hex + blake2.
+#
+# Phase 2: nedb_core_v2::Db — real BLAKE2b chain head, MVCC AS OF,
+#   causal DAG (caused_by), AES-256-GCM via NEDB_TMK, full TRACE.
+#   One feature flag away from production.
+[features]
+default = []
+phase2  = ["nedb-core-v2"]
 
+# ── Dependencies ──────────────────────────────────────────────────────────
+[dependencies]
 hex    = "0.4"
-blake2 = "0.10"  # for the state-root head computation
+blake2 = "0.10"   # Phase 1 BLAKE2b chain head
+
+# Phase 2: real NEDB DAG engine.
+# Uncomment the dep below AND enable the phase2 feature to activate.
+# The crate lives in rust/nedb-v2/ inside the nedb engine repo.
+nedb-core-v2 = { git = "https://github.com/Eth-Interchained/nedb", package = "nedb-core-v2", optional = true }
 
 [build-dependencies]
 # cbindgen auto-generates nedb.h from the #[no_mangle] exports in src/lib.rs
 cbindgen = "0.26"
 
 [profile.release]
-opt-level = 3
-lto = true
+opt-level     = 3
+lto           = true
 codegen-units = 1
