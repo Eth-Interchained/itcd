@@ -99,11 +99,13 @@ jobs:
           rm -rf "$TMPV"
           [ "$BITCODE" -eq 0 ] || { echo "ERROR: archive still contains LLVM bitcode"; exit 1; }
 
-          # Verify nedb_* symbols are real text-section exports
+          # Verify nedb_* symbols are real text-section exports and that
+          # cbindgen preserved C++ compatibility in the generated header.
           SYMS=$(nm target/release/libnedb_ffi.a 2>/dev/null | grep -c ' T nedb_' || echo 0)
           echo "nedb_* T-symbols: $SYMS"
           nm target/release/libnedb_ffi.a 2>/dev/null | grep ' T nedb_' | head -10
           [ "$SYMS" -gt 0 ] || { echo "ERROR: no nedb_* T symbols — still bitcode?"; exit 1; }
+          grep -q 'extern "C"' nedb.h || { echo "ERROR: generated nedb.h lacks extern C guard"; exit 1; }
 
           # Generate the libtool wrapper consumed by src/Makefile.am LDADD.
           # This keeps libnedb_ffi.a in the app link line without leaking it
@@ -193,7 +195,40 @@ jobs:
           # src/Makefile.am links NEDB-consuming binaries through the generated
           # libtool wrapper, keeping the FFI archive scoped to app links.
           test -f "$(pwd)/nedb-ffi/target/release/libnedb_ffi.la"
-          nm "$(pwd)/nedb-ffi/target/release/libnedb_ffi.a" | grep ' T nedb_get'
+          export NEDB_LIB="$(pwd)/nedb-ffi/target/release/libnedb_ffi.a"
+          test -f "$NEDB_LIB"
+          nm "$NEDB_LIB" | grep ' T nedb_get'
+
+          # Defensive CI-only final-link override: group the Bitcoin-style C++
+          # archives with the Rust FFI archive for final executable links.
+          # GNU ld normally resolves static archives left-to-right once; grouping
+          # makes it rescan until nedb_* references from server/wallet archives
+          # are satisfied by libnedb_ffi.a even if libtool reorders .la deplibs.
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          p = Path('src/Makefile')
+          s = p.read_text()
+          group_start = '-Wl,--start-group'
+          group_end = '-Wl,--end-group'
+          nedb = os.environ['NEDB_LIB']
+          rust_syslibs = '-ldl -lpthread -lm'
+          replacements = {
+              'interchainedd_LDADD = $(LIBBITCOIN_SERVER) $(interchained_bin_ldadd) $(NEDB_FFI_LA)':
+                  f'interchainedd_LDADD = {group_start} $(LIBBITCOIN_SERVER) $(interchained_bin_ldadd) {nedb} {rust_syslibs} {group_end}',
+              'interchained_node_LDADD = $(LIBBITCOIN_SERVER) $(interchained_bin_ldadd) $(NEDB_FFI_LA)':
+                  f'interchained_node_LDADD = {group_start} $(LIBBITCOIN_SERVER) $(interchained_bin_ldadd) {nedb} {rust_syslibs} {group_end}',
+              'interchained_wallet_LDADD = $(LIBBITCOIN_WALLET_TOOL) $(interchained_bin_ldadd) $(NEDB_FFI_LA)':
+                  f'interchained_wallet_LDADD = {group_start} $(LIBBITCOIN_WALLET_TOOL) $(interchained_bin_ldadd) {nedb} {rust_syslibs} {group_end}',
+          }
+          for old, new in replacements.items():
+              if old not in s:
+                  raise SystemExit(f'missing expected Makefile line: {old}')
+              s = s.replace(old, new, 1)
+          p.write_text(s)
+          PY
+          grep '^interchainedd_LDADD = .*--start-group.*libnedb_ffi\.a.*--end-group' src/Makefile
+          grep '^interchained_wallet_LDADD = .*--start-group.*libnedb_ffi\.a.*--end-group' src/Makefile
 
           make -j"$JOBS"
           test -f "$D_BIN" && test -f "$CLI_BIN"
