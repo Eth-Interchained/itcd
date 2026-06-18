@@ -11,6 +11,21 @@ AM_LIBTOOLFLAGS = --preserve-dup-deps
 PTHREAD_FLAGS = $(PTHREAD_CFLAGS) $(PTHREAD_LIBS)
 EXTRA_LIBRARIES =
 
+# ── NEDB FFI (Rust staticlib) ─────────────────────────────────────────────────
+# Builds the nedb-ffi Rust crate before any C++ compilation.
+# The FORCE target ensures cargo handles incremental rebuilds itself.
+NEDB_FFI_DIR  = $(abs_top_srcdir)/nedb-ffi
+NEDB_FFI_LIB  = $(NEDB_FFI_DIR)/target/release/libnedb_ffi.a
+
+$(NEDB_FFI_LIB): FORCE
+	$(AM_V_GEN) cd $(NEDB_FFI_DIR) && cargo build --release
+
+FORCE:
+.PHONY: FORCE
+
+all-local: $(NEDB_FFI_LIB)
+# ─────────────────────────────────────────────────────────────────────────────
+
 if EMBEDDED_UNIVALUE
 LIBUNIVALUE = univalue/libunivalue.la
 
@@ -20,7 +35,7 @@ else
 LIBUNIVALUE = $(UNIVALUE_LIBS)
 endif
 
-BITCOIN_INCLUDES=-I$(builddir) -I$(srcdir)/secp256k1/include $(BDB_CPPFLAGS) $(BOOST_CPPFLAGS) $(LEVELDB_CPPFLAGS)
+BITCOIN_INCLUDES=-I$(builddir) -I$(srcdir)/secp256k1/include $(BDB_CPPFLAGS) $(BOOST_CPPFLAGS) -I$(abs_top_srcdir)
 
 BITCOIN_INCLUDES += $(UNIVALUE_CFLAGS)
 
@@ -291,7 +306,7 @@ libinterchained_server_a_SOURCES = \
   blockfilter.cpp \
   chain.cpp \
   consensus/tx_verify.cpp \
-  dbwrapper.cpp \
+  dbwrapper_nedb.cpp \
   flatfile.cpp \
   httprpc.cpp \
   httpserver.cpp \
@@ -392,7 +407,7 @@ libinterchained_wallet_a_SOURCES = \
   net.cpp \
   net.cpp \
   addrdb.cpp \
-  dbwrapper.cpp \
+  dbwrapper_nedb.cpp \
   policy/policy.cpp \
   policy/fees.cpp \
   policy/settings.cpp \
@@ -645,12 +660,12 @@ interchained_bin_ldadd = \
   $(LIBBITCOIN_ZMQ) \
   $(LIBBITCOIN_CONSENSUS) \
   $(LIBBITCOIN_CRYPTO) \
-  $(LIBLEVELDB) \
-  $(LIBLEVELDB_SSE42) \
-  $(LIBMEMENV) \
+  $(NEDB_FFI_LIB) \
   $(LIBSECP256K1)
 
 interchained_bin_ldadd += $(BOOST_LIBS) $(BDB_LIBS) $(MINIUPNPC_LIBS) $(EVENT_PTHREADS_LIBS) $(EVENT_LIBS) $(ZMQ_LIBS) $(SQLITE_LIBS)
+# NEDB FFI Rust runtime deps (pthread + dl on Linux/macOS; MSVC handles Windows)
+interchained_bin_ldadd += -lpthread $(DL_LIBS)
 
 interchainedd_SOURCES = $(interchained_daemon_sources)
 interchainedd_CPPFLAGS = $(interchained_bin_cppflags)

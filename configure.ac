@@ -59,6 +59,22 @@ else
 fi
 AC_PROG_CXX
 
+dnl ── NEDB FFI: require Rust + Cargo ────────────────────────────────────────
+AC_CHECK_PROG([CARGO], [cargo], [yes], [no])
+AS_IF([test "x$CARGO" = "xno"],
+  [AC_MSG_ERROR([cargo (Rust toolchain) is required for the NEDB storage backend. Install from https://rustup.rs])])
+AC_MSG_CHECKING([cargo version])
+CARGO_VERSION=$($CARGO --version 2>/dev/null)
+AC_MSG_RESULT([$CARGO_VERSION])
+
+dnl DL_LIBS: -ldl on Linux, empty on macOS/Windows (Rust staticlib handles it)
+DL_LIBS=
+case $host in
+  *-linux-*) DL_LIBS="-ldl" ;;
+esac
+AC_SUBST([DL_LIBS])
+dnl ─────────────────────────────────────────────────────────────────────────
+
 dnl By default, libtool for mingw refuses to link static libs into a dll for
 dnl fear of mixing pic/non-pic objects, and import/export complications. Since
 dnl we have those under control, re-enable that functionality.
