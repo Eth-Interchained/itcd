@@ -18,6 +18,10 @@
 //!
 //! © Interchained LLC × Claude Sonnet 4.6
 
+// C FFI functions take raw pointers by design — suppress the safety lints.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(clippy::missing_safety_doc)]
+
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_uchar};
@@ -38,8 +42,6 @@ struct NedbInner {
     /// Running BLAKE2b chain head — advances with every committed write.
     /// In Phase 2 this becomes the NEDB Merkle head and IS the state root.
     head: Vec<u8>,
-    /// Logical name for this database instance (= path used at open time).
-    name: String,
 }
 
 impl NedbInner {
@@ -83,14 +85,13 @@ pub extern "C" fn nedb_open(path: *const c_char, _dek: *const c_char) -> *mut Ne
     if path.is_null() {
         return std::ptr::null_mut();
     }
-    let name = unsafe { CStr::from_ptr(path).to_string_lossy().to_string() };
-    // Phase 2: pass name + dek to nedb_core_v2::Db::open(name, dek)
+    let _path = unsafe { CStr::from_ptr(path) }; // validated non-null above
+    // Phase 2: pass path + dek to nedb_core_v2::Db::open(path, dek)
     let handle = Box::new(NedbHandle {
         inner: Mutex::new(NedbInner {
             store: BTreeMap::new(),
             seq: 0,
             head: vec![0u8; 64], // 512-bit genesis head (all zeros = genesis)
-            name,
         }),
     });
     Box::into_raw(handle)
@@ -141,13 +142,13 @@ pub extern "C" fn nedb_get(
     }
 }
 
-/// Free a value buffer returned by `nedb_get`.
+/// Free a value buffer returned by `nedb_get` or `nedb_iter_key/value`.
 #[no_mangle]
 pub extern "C" fn nedb_free_value(ptr: *mut c_uchar, len: usize) {
     if !ptr.is_null() && len > 0 {
-        unsafe {
-            let _ = Box::from_raw(std::slice::from_raw_parts_mut(ptr, len) as *mut [u8]);
-        }
+        // Reconstruct the Box<[u8]> that was leaked via into_boxed_slice + forget.
+        // Safety: ptr/len were produced by our own Box<[u8]>::into_raw path.
+        unsafe { drop(Vec::from_raw_parts(ptr, len, len)) }
     }
 }
 

@@ -23,7 +23,10 @@ $(NEDB_FFI_LIB): FORCE
 FORCE:
 .PHONY: FORCE
 
-all-local: $(NEDB_FFI_LIB)
+# Link binaries depend on the FFI lib — ensures cargo runs before the link step.
+# (all-local runs AFTER linking; _DEPENDENCIES runs BEFORE.)
+interchainedd_DEPENDENCIES       = $(NEDB_FFI_LIB)
+interchained_node_DEPENDENCIES   = $(NEDB_FFI_LIB)
 # ─────────────────────────────────────────────────────────────────────────────
 
 if EMBEDDED_UNIVALUE
