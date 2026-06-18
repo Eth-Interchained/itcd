@@ -130,15 +130,19 @@ jobs:
             --with-miniupnpc \
           || { echo "=== config.log ==="; cat config.log || true; exit 1; }
 
-          # Pass libnedb_ffi.a via LIBS= (not LDFLAGS, not LDADD).
-          # LIBS is appended after LDADD in the libtool link command, so
-          # libnedb_ffi.a lands after libinterchained_wallet.a — correct
-          # order for single-pass static archive symbol resolution.
-          # Using LIBS= on the make CLI bypasses libtool's .la-file checks.
+          # Link libnedb_ffi.a via LIBS= with -Wl, prefix so libtool passes
+          # the flags directly to ld without reordering them.
+          #
+          # Without -Wl,--whole-archive: libtool moves raw .a files to a
+          # 'deplibs' bucket that lands BEFORE the C++ archives in the final
+          # link command (single-pass ld discards symbols with no outstanding
+          # refs at that point; wallet/server refs unresolved afterward).
+          #
+          # With -Wl,--whole-archive: ld includes ALL members of libnedb_ffi.a
+          # regardless of link position. -Wl, prefix bypasses libtool processing.
           # $(pwd) gives the container-internal path (/__w/itcd/itcd).
           NEDB_LIB="$(pwd)/nedb-ffi/target/release/libnedb_ffi.a"
-          CONFIGURED_LIBS=$(grep '^LIBS = ' src/Makefile 2>/dev/null | head -1 | sed 's/LIBS = //' || true)
-          make -j"$JOBS" LIBS="${CONFIGURED_LIBS} ${NEDB_LIB} -lpthread -ldl"
+          make -j"$JOBS" LIBS="-Wl,--whole-archive -Wl,${NEDB_LIB} -Wl,--no-whole-archive -lpthread -ldl"
           test -f "$D_BIN" && test -f "$CLI_BIN"
 
       - name: Verify it will run on Ubuntu (no musl interpreter)
