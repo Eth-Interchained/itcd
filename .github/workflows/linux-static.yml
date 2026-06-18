@@ -193,7 +193,7 @@ jobs:
           # src/Makefile.am links NEDB-consuming binaries through the generated
           # libtool wrapper, keeping the FFI archive scoped to app links.
           test -f "$(pwd)/nedb-ffi/target/release/libnedb_ffi.la"
-          NEDB_LIB="$(pwd)/nedb-ffi/target/release/libnedb_ffi.a"
+          export NEDB_LIB="$(pwd)/nedb-ffi/target/release/libnedb_ffi.a"
           test -f "$NEDB_LIB"
           nm "$NEDB_LIB" | grep ' T nedb_get'
 
@@ -203,12 +203,13 @@ jobs:
           # makes it rescan until nedb_* references from server/wallet archives
           # are satisfied by libnedb_ffi.a even if libtool reorders .la deplibs.
           python3 - <<'PY'
+          import os
           from pathlib import Path
           p = Path('src/Makefile')
           s = p.read_text()
           group_start = '-Wl,--start-group'
           group_end = '-Wl,--end-group'
-          nedb = '$(abs_top_builddir)/../nedb-ffi/target/release/libnedb_ffi.a'
+          nedb = os.environ['NEDB_LIB']
           replacements = {
               'interchainedd_LDADD = $(LIBBITCOIN_SERVER) $(interchained_bin_ldadd) $(NEDB_FFI_LA)':
                   f'interchainedd_LDADD = {group_start} $(LIBBITCOIN_SERVER) $(interchained_bin_ldadd) {nedb} {group_end}',
