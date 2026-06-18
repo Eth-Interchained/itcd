@@ -386,3 +386,194 @@ pub extern "C" fn nedb_iter_value(
     }
     0
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    /// Open a fresh handle using a simple label as the path.
+    /// Phase 1: path is stored as a label only — no disk I/O.
+    fn open(name: &str) -> *mut NedbHandle {
+        let path = CString::new(name).unwrap();
+        let h = nedb_open(path.as_ptr(), std::ptr::null());
+        assert!(!h.is_null(), "nedb_open returned null for '{}'", name);
+        h
+    }
+
+    #[test]
+    fn test_open_close() {
+        let h = open("t_open");
+        nedb_close(h);
+    }
+
+    #[test]
+    fn test_put_get_roundtrip() {
+        let h = open("t_roundtrip");
+        let k: &[u8] = b"block:0";
+        let v: &[u8] = b"genesis_payload_bytes";
+
+        assert_eq!(nedb_put(h, k.as_ptr(), k.len(), v.as_ptr(), v.len()), 0);
+
+        let mut out: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        assert_eq!(nedb_get(h, k.as_ptr(), k.len(), &mut out, &mut out_len), 0,
+            "get should return 0 (found)");
+        assert_eq!(out_len, v.len(), "value length mismatch");
+        let got = unsafe { std::slice::from_raw_parts(out, out_len) };
+        assert_eq!(got, v, "value content mismatch");
+        nedb_free_value(out, out_len);
+        nedb_close(h);
+    }
+
+    #[test]
+    fn test_get_not_found() {
+        let h = open("t_missing");
+        let k = b"ghost_key";
+        let mut out: *mut u8 = std::ptr::null_mut();
+        let mut len: usize = 0;
+        assert_eq!(nedb_get(h, k.as_ptr(), k.len(), &mut out, &mut len), 1,
+            "get should return 1 (not found)");
+        nedb_close(h);
+    }
+
+    #[test]
+    fn test_exists_and_del() {
+        let h = open("t_exists");
+        let k = b"the_key";
+        let v = b"the_val";
+        assert_eq!(nedb_exists(h, k.as_ptr(), k.len()), 0, "should not exist before put");
+        nedb_put(h, k.as_ptr(), k.len(), v.as_ptr(), v.len());
+        assert_eq!(nedb_exists(h, k.as_ptr(), k.len()), 1, "should exist after put");
+        nedb_del(h, k.as_ptr(), k.len());
+        assert_eq!(nedb_exists(h, k.as_ptr(), k.len()), 0, "should not exist after del");
+        nedb_close(h);
+    }
+
+    #[test]
+    fn test_is_empty() {
+        let h = open("t_empty");
+        assert_eq!(nedb_is_empty(h), 1, "should be empty on open");
+        let k = b"k"; let v = b"v";
+        nedb_put(h, k.as_ptr(), k.len(), v.as_ptr(), v.len());
+        assert_eq!(nedb_is_empty(h), 0, "should not be empty after put");
+        nedb_close(h);
+    }
+
+    #[test]
+    fn test_blake2b_head_advances() {
+        let h = open("t_head");
+
+        let h0 = {
+            let r = nedb_head(h);
+            let s = unsafe { CStr::from_ptr(r).to_string_lossy().to_string() };
+            nedb_free_str(r);
+            s
+        };
+        assert_eq!(h0.len(), 128, "initial BLAKE2b-512 head must be 128 hex chars");
+
+        let k = b"block:1"; let v = b"block_one";
+        nedb_put(h, k.as_ptr(), k.len(), v.as_ptr(), v.len());
+
+        let h1 = {
+            let r = nedb_head(h);
+            let s = unsafe { CStr::from_ptr(r).to_string_lossy().to_string() };
+            nedb_free_str(r);
+            s
+        };
+        assert_ne!(h0, h1, "BLAKE2b head must advance after write");
+        assert_eq!(h1.len(), 128, "BLAKE2b-512 must produce 128 hex chars");
+        nedb_close(h);
+    }
+
+    #[test]
+    fn test_batch_write_put_and_delete() {
+        let h = open("t_batch");
+        // Pre-insert 'c' so the batch can delete it
+        let c = b"c"; let cv = b"to_be_deleted";
+        nedb_put(h, c.as_ptr(), c.len(), cv.as_ptr(), cv.len());
+
+        let ops = vec![
+            NedbOp { key: b"a".as_ptr(), key_len: 1, value: b"1".as_ptr(), value_len: 1 },
+            NedbOp { key: b"b".as_ptr(), key_len: 1, value: b"2".as_ptr(), value_len: 1 },
+            // null value = delete
+            NedbOp { key: c.as_ptr(),   key_len: 1, value: std::ptr::null(), value_len: 0 },
+        ];
+        assert_eq!(nedb_batch_write(h, ops.as_ptr(), ops.len()), 0);
+        assert_eq!(nedb_exists(h, b"a".as_ptr(), 1), 1, "a should exist");
+        assert_eq!(nedb_exists(h, b"b".as_ptr(), 1), 1, "b should exist");
+        assert_eq!(nedb_exists(h, b"c".as_ptr(), 1), 0, "c should be deleted by batch");
+        nedb_close(h);
+    }
+
+    #[test]
+    fn test_iterator_returns_ordered_keys() {
+        let h = open("t_iter");
+        // Insert out of order — BTreeMap must return in ascending key order
+        nedb_put(h, b"c".as_ptr(), 1, b"3".as_ptr(), 1);
+        nedb_put(h, b"a".as_ptr(), 1, b"1".as_ptr(), 1);
+        nedb_put(h, b"b".as_ptr(), 1, b"2".as_ptr(), 1);
+
+        let iter = nedb_iter_new(h);
+        assert!(!iter.is_null());
+        nedb_iter_seek_to_first(iter);
+
+        let mut keys: Vec<u8> = Vec::new();
+        while nedb_iter_valid(iter) == 1 {
+            let mut kptr: *mut u8 = std::ptr::null_mut();
+            let mut klen: usize = 0;
+            assert_eq!(nedb_iter_key(iter, &mut kptr, &mut klen), 0);
+            keys.push(unsafe { *kptr });
+            nedb_free_value(kptr, klen);
+            nedb_iter_next(iter);
+        }
+        assert_eq!(keys, vec![b'a', b'b', b'c'], "BTreeMap must iterate in ascending key order");
+        nedb_iter_free(iter);
+        nedb_close(h);
+    }
+
+    /// THE CONSENSUS PROPERTY:
+    /// Two nodes that process identical block sequences must arrive at
+    /// identical BLAKE2b heads.  This is the storage-layer consensus proof.
+    #[test]
+    fn test_head_determinism_is_the_consensus_property() {
+        let h1 = open("t_det_node_1");
+        let h2 = open("t_det_node_2");
+
+        // Simulate writing the same blocks on two independent nodes
+        let writes: &[(&[u8], &[u8])] = &[
+            (b"block:0",  b"genesis_hash_bytes"),
+            (b"block:1",  b"block_one_bytes"),
+            (b"utxo:abc:0", b"satoshi_coinbase_output"),
+        ];
+
+        for &(k, v) in writes {
+            nedb_put(h1, k.as_ptr(), k.len(), v.as_ptr(), v.len());
+            nedb_put(h2, k.as_ptr(), k.len(), v.as_ptr(), v.len());
+        }
+
+        let head1 = {
+            let r = nedb_head(h1);
+            let s = unsafe { CStr::from_ptr(r).to_string_lossy().to_string() };
+            nedb_free_str(r);
+            s
+        };
+        let head2 = {
+            let r = nedb_head(h2);
+            let s = unsafe { CStr::from_ptr(r).to_string_lossy().to_string() };
+            nedb_free_str(r);
+            s
+        };
+
+        assert_eq!(head1, head2,
+            "CONSENSUS FAILURE: identical write sequences produced different BLAKE2b heads. \
+             Two nodes processing the same chain must converge to the same state root.");
+
+        nedb_close(h1);
+        nedb_close(h2);
+    }
+}
