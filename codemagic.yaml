@@ -174,10 +174,30 @@ workflows:
               --prefix="$CM_BUILD_DIR/db4" --enable-cxx --disable-shared --with-pic
           arch -x86_64 make -j"$J"
           arch -x86_64 make install
+          # Some Rosetta builds install the static libraries but omit headers from
+          # the configured prefix. Stage them explicitly so the wallet configure
+          # check can find <db_cxx.h> under $CM_BUILD_DIR/db4/include.
+          mkdir -p "$CM_BUILD_DIR/db4/include"
+          for header in db.h db_cxx.h; do
+            if [ ! -f "$CM_BUILD_DIR/db4/include/$header" ]; then
+              cp "/tmp/bdb-src/build_unix/$header" "$CM_BUILD_DIR/db4/include/$header" 2>/dev/null \
+                || cp "/tmp/bdb-src/$header" "$CM_BUILD_DIR/db4/include/$header"
+            fi
+          done
+          test -f "$CM_BUILD_DIR/db4/include/db_cxx.h" || {
+            echo "ERROR: Berkeley DB C++ header missing after install"
+            find "$CM_BUILD_DIR/db4" -maxdepth 3 -type f | sort
+            exit 1
+          }
           ln -sf "$CM_BUILD_DIR/db4/lib/libdb_cxx.a" \
                  "$CM_BUILD_DIR/db4/lib/libdb_cxx-4.8.a" 2>/dev/null || true
           ln -sf "$CM_BUILD_DIR/db4/lib/libdb.a" \
                  "$CM_BUILD_DIR/db4/lib/libdb-4.8.a"     2>/dev/null || true
+          test -f "$CM_BUILD_DIR/db4/lib/libdb_cxx-4.8.a" || {
+            echo "ERROR: Berkeley DB C++ static library missing after install"
+            find "$CM_BUILD_DIR/db4" -maxdepth 3 -type f | sort
+            exit 1
+          }
 
       - name: Configure & Build interchainedd (x86_64 via Rosetta)
         script: |

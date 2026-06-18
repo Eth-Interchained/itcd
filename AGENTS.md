@@ -192,6 +192,30 @@ libnedb_ffi.a -ldl -lpthread -lm
 
 If a future Rust dependency introduces another native library, add it there, after confirming with the linker error and keeping the dependency in the same final-link group.
 
+### 7. Codemagic macOS x86_64 wallet configure could not find BDB headers
+
+Symptom:
+
+```text
+configure:34155: error: libdb_cxx headers missing, Interchained Core requires this library for wallet functionality (--disable-wallet to disable wallet functionality)
+g++ ... -I/Users/builder/clone/db4/include ... conftest.cpp
+conftest.cpp:67:18: fatal error: 'db_cxx.h' file not found
+```
+
+Important subtlety:
+
+- The x86_64 Codemagic job builds Berkeley DB 4.8 under Rosetta and points configure at `$CM_BUILD_DIR/db4/include`.
+- The failing configure command already had the correct `-I` flag, so the issue was not lost `CPPFLAGS`.
+- The failure means `db_cxx.h` was not present in the configured prefix after the BDB install step.
+
+Fix pattern in `codemagic.yaml`:
+
+- After `arch -x86_64 make install`, explicitly ensure `$CM_BUILD_DIR/db4/include` exists.
+- Stage `db.h` and `db_cxx.h` from the BDB build/source tree into that include directory if install omitted them.
+- Fail early with a directory listing if `db_cxx.h` or `libdb_cxx-4.8.a` is still missing.
+
+Do not respond to this failure by disabling wallet support; the macOS artifacts are intended to ship wallet-enabled binaries.
+
 ## Current portable glibc link strategy
 
 The working strategy is layered:
@@ -235,6 +259,7 @@ This is intentionally CI-scoped because the portable packaging workflow is the p
 | `No such file or directory ... libnedb_ffi.a` | Wrong final archive path | `NEDB_LIB` export and generated Makefile rewrite |
 | `undefined reference to nedb_get(NedbHandle*, ...)` | C++ mangled caller reference | `nedb-ffi/build.rs` cbindgen `with_cpp_compat(true)` |
 | `libnedb_ffi.a(...): undefined reference to dlsym` | Rust archive is linked, but native syslib missing | Rust syslibs in final link group |
+| `libdb_cxx headers missing` with `-I.../db4/include` present | BDB install prefix lacks `db_cxx.h` | `codemagic.yaml` BDB header staging/checks |
 | `no nedb_* T symbols` | Rust archive did not export expected FFI | `nedb-ffi/src/lib.rs`, Rust build flags, LTO/bitcode checks |
 | LLVM bitcode magic in extracted objects | Rust archive unusable by GNU ld path | `lto=false`, `RUSTFLAGS=-C embed-bitcode=no` |
 
