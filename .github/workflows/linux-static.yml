@@ -54,29 +54,56 @@ jobs:
             libzmq3-dev libsqlite3-dev libssl-dev \
             file curl xz-utils perl patchelf
 
-      # ── NEDB FFI: build real Rust implementation with lto=no ─────────────
-      # The release profile has lto=true which emits LLVM bitcode fat objects.
-      # `cargo rustc -- -C lto=no` overrides the Cargo.toml setting per-run,
-      # producing native ELF .o files that ar x can extract and GNU ld can link.
-      # This replaces the C stub and gives us the REAL BTreeMap implementation.
+      # ── NEDB FFI: build real Rust staticlib with native ELF objects ──────
+      # Root cause (Opus-diagnosed): lto=true in [profile.release] forces
+      # embed-bitcode=yes. ALL rcgu objects become LLVM bitcode-only ELF wrappers
+      # — no native .text. ar x extracts them but GNU ld cannot consume them.
+      # cargo rustc -- -C lto=no doesn't help because the profile decision
+      # (and embed-bitcode setting) happens before -- flags are merged.
+      #
+      # Fix: sed-patch Cargo.toml at runtime (ephemeral container, not committed),
+      # then RUSTFLAGS="-C embed-bitcode=no". ELF magic-byte verification fails
+      # fast if bitcode is still present.
       - name: Install Rust (stable, minimal)
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Build NEDB FFI — real Rust impl, LTO disabled for ELF extraction
+      - name: Build NEDB FFI — real Rust impl, lto patched out at runtime
         run: |
           . "$HOME/.cargo/env"
+
+          # Patch Cargo.toml: lto=true → lto=false (runtime only, ephemeral container)
+          sed -i 's/^lto[[:space:]]*=.*/lto = false/' nedb-ffi/Cargo.toml
+          echo "Profile after patch:"; grep -E '^(lto|opt-level|codegen-units)' nedb-ffi/Cargo.toml
+
           cd nedb-ffi
-          # -C lto=no: override Cargo.toml lto=true for this build only.
-          # With lto=true, rustc emits LLVM bitcode fat objects that ar x
-          # cannot extract as usable ELF for GNU ld. With lto=no, each
-          # codegen unit becomes a real x86-64 ELF object file.
-          cargo rustc --release --crate-type staticlib -- -C lto=no
+          RUSTFLAGS="-C embed-bitcode=no" cargo rustc --release --crate-type=staticlib
           echo "libnedb_ffi.a: $(du -sh target/release/libnedb_ffi.a | cut -f1)"
-          echo "nedb_* symbols: $(nm target/release/libnedb_ffi.a 2>/dev/null | grep -c ' T nedb_' || echo 0)"
-          nm target/release/libnedb_ffi.a 2>/dev/null | grep ' T nedb_' | head -15
+
+          # Verify rcgu objects are native ELF, NOT LLVM bitcode
+          # ELF magic: 7f454c46  Bitcode magic: 4243c0de
+          TMPV=$(mktemp -d)
+          (cd "$TMPV" && ar x "$(pwd)/target/release/libnedb_ffi.a" 2>/dev/null || true)
+          BITCODE=0
+          for f in "$TMPV"/*nedb_ffi*.o; do
+            [ -f "$f" ] || continue
+            magic=$(head -c4 "$f" | od -An -tx1 | tr -d ' \n')
+            case "$magic" in
+              7f454c46*) echo "ELF OK: $(basename $f)" ;;
+              4243c0de*|42c3c0de*) echo "BITCODE: $(basename $f)"; BITCODE=1 ;;
+              *) echo "UNKNOWN $magic: $(basename $f)"; BITCODE=1 ;;
+            esac
+          done
+          rm -rf "$TMPV"
+          [ "$BITCODE" -eq 0 ] || { echo "ERROR: archive still contains LLVM bitcode"; exit 1; }
+
+          # Verify nedb_* symbols are real text-section exports
+          SYMS=$(nm target/release/libnedb_ffi.a 2>/dev/null | grep -c ' T nedb_' || echo 0)
+          echo "nedb_* T-symbols: $SYMS"
+          nm target/release/libnedb_ffi.a 2>/dev/null | grep ' T nedb_' | head -10
+          [ "$SYMS" -gt 0 ] || { echo "ERROR: no nedb_* T symbols — still bitcode?"; exit 1; }
       # ─────────────────────────────────────────────────────────────────────
 
       - name: Build Berkeley DB 4.8 (portable) from observerdev/db-4.8.30
