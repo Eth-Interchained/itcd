@@ -1,6 +1,14 @@
 // Copyright (c) 2012-2019 The Interchained Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+//
+// NEDB backend — LevelDB replaced by the NEDB causal DAG engine.
+// Public interface (CDBWrapper, CDBBatch, CDBIterator) is unchanged.
+// See nedb-ffi/ for the Rust FFI layer and NEDB.md for architecture notes.
+//
+// Phase 1: in-process BTreeMap (HashMap-backed, ordered) — proves the seam.
+// Phase 2: nedb_core_v2::Db — BLAKE2b chain head, MVCC AS OF, causal DAG,
+//          AES-256-GCM at-rest encryption, deterministic state roots.
 
 #ifndef BITCOIN_DBWRAPPER_H
 #define BITCOIN_DBWRAPPER_H
@@ -12,10 +20,15 @@
 #include <util/system.h>
 #include <util/strencodings.h>
 
-#include <leveldb/db.h>
-#include <leveldb/write_batch.h>
+// NEDB C FFI — replaces #include <leveldb/db.h> and <leveldb/write_batch.h>
+#include "../nedb-ffi/nedb.h"
 
-static const size_t DBWRAPPER_PREALLOC_KEY_SIZE = 64;
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+static const size_t DBWRAPPER_PREALLOC_KEY_SIZE   = 64;
 static const size_t DBWRAPPER_PREALLOC_VALUE_SIZE = 1024;
 
 class dbwrapper_error : public std::runtime_error
@@ -26,20 +39,29 @@ public:
 
 class CDBWrapper;
 
-/** These should be considered an implementation detail of the specific database.
- */
+/** Implementation details of the database layer. */
 namespace dbwrapper_private {
 
-/** Handle database error by throwing dbwrapper_error exception.
+/** Return the obfuscation key for @w.
+ *
+ *  NEDB backend: obfuscation is always the zero vector (XOR is a no-op).
+ *  Encryption is handled natively by the NEDB DAG engine (AES-256-GCM via TMK).
+ *  This function is retained for API compatibility with code that calls
+ *  dbwrapper_private::GetObfuscateKey() directly.
  */
-void HandleError(const leveldb::Status& status);
+const std::vector<unsigned char>& GetObfuscateKey(const CDBWrapper& w);
 
-/** Work around circular dependency, as well as for testing in dbwrapper_tests.
- * Database obfuscation should be considered an implementation detail of the
- * specific database.
- */
-const std::vector<unsigned char>& GetObfuscateKey(const CDBWrapper &w);
+} // namespace dbwrapper_private
 
+// ---------------------------------------------------------------------------
+// CDBBatch — accumulates put / erase operations for atomic commit
+// ---------------------------------------------------------------------------
+
+/** An individual pending write.  value is empty + is_delete=true for erases. */
+struct NedbBatchEntry {
+    std::vector<unsigned char> key;
+    std::vector<unsigned char> value;
+    bool is_delete;
 };
 
 /** Batch of changes queued to be written to a CDBWrapper */
@@ -48,8 +70,10 @@ class CDBBatch
     friend class CDBWrapper;
 
 private:
-    const CDBWrapper &parent;
-    leveldb::WriteBatch batch;
+    const CDBWrapper& parent;
+
+    /** Accumulated operations — written atomically via nedb_batch_write(). */
+    std::vector<NedbBatchEntry> m_ops;
 
     CDataStream ssKey;
     CDataStream ssValue;
@@ -57,14 +81,15 @@ private:
     size_t size_estimate;
 
 public:
-    /**
-     * @param[in] _parent   CDBWrapper that this batch is to be submitted to
-     */
-    explicit CDBBatch(const CDBWrapper &_parent) : parent(_parent), ssKey(SER_DISK, CLIENT_VERSION), ssValue(SER_DISK, CLIENT_VERSION), size_estimate(0) { };
+    explicit CDBBatch(const CDBWrapper& _parent)
+        : parent(_parent),
+          ssKey(SER_DISK, CLIENT_VERSION),
+          ssValue(SER_DISK, CLIENT_VERSION),
+          size_estimate(0) {}
 
     void Clear()
     {
-        batch.Clear();
+        m_ops.clear();
         size_estimate = 0;
     }
 
@@ -73,22 +98,24 @@ public:
     {
         ssKey.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
         ssKey << key;
-        leveldb::Slice slKey(ssKey.data(), ssKey.size());
 
         ssValue.reserve(DBWRAPPER_PREALLOC_VALUE_SIZE);
         ssValue << value;
+        // NEDB backend: obfuscate_key is all zeros, so XOR is a no-op.
+        // NEDB's own AES-256-GCM encryption (Phase 2) supersedes it entirely.
         ssValue.Xor(dbwrapper_private::GetObfuscateKey(parent));
-        leveldb::Slice slValue(ssValue.data(), ssValue.size());
 
-        batch.Put(slKey, slValue);
-        // LevelDB serializes writes as:
-        // - byte: header
-        // - varint: key length (1 byte up to 127B, 2 bytes up to 16383B, ...)
-        // - byte[]: key
-        // - varint: value length
-        // - byte[]: value
-        // The formula below assumes the key and value are both less than 16k.
-        size_estimate += 3 + (slKey.size() > 127) + slKey.size() + (slValue.size() > 127) + slValue.size();
+        NedbBatchEntry entry;
+        entry.key       = std::vector<unsigned char>(ssKey.begin(),   ssKey.end());
+        entry.value     = std::vector<unsigned char>(ssValue.begin(), ssValue.end());
+        entry.is_delete = false;
+
+        // Size estimate mirrors the LevelDB wire format (varint + bytes).
+        size_estimate += 3
+            + (entry.key.size()   > 127) + entry.key.size()
+            + (entry.value.size() > 127) + entry.value.size();
+
+        m_ops.push_back(std::move(entry));
         ssKey.clear();
         ssValue.clear();
     }
@@ -98,132 +125,140 @@ public:
     {
         ssKey.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
         ssKey << key;
-        leveldb::Slice slKey(ssKey.data(), ssKey.size());
 
-        batch.Delete(slKey);
-        // LevelDB serializes erases as:
-        // - byte: header
-        // - varint: key length
-        // - byte[]: key
-        // The formula below assumes the key is less than 16kB.
-        size_estimate += 2 + (slKey.size() > 127) + slKey.size();
+        NedbBatchEntry entry;
+        entry.key       = std::vector<unsigned char>(ssKey.begin(), ssKey.end());
+        entry.is_delete = true;
+
+        size_estimate += 2 + (entry.key.size() > 127) + entry.key.size();
+
+        m_ops.push_back(std::move(entry));
         ssKey.clear();
     }
 
     size_t SizeEstimate() const { return size_estimate; }
 };
 
+// ---------------------------------------------------------------------------
+// CDBIterator — snapshot iterator over a NEDB database
+// ---------------------------------------------------------------------------
+
 class CDBIterator
 {
 private:
-    const CDBWrapper &parent;
-    leveldb::Iterator *piter;
+    const CDBWrapper& parent;
+    NedbIter*         piter;
 
 public:
-
-    /**
-     * @param[in] _parent          Parent CDBWrapper instance.
-     * @param[in] _piter           The original leveldb iterator.
-     */
-    CDBIterator(const CDBWrapper &_parent, leveldb::Iterator *_piter) :
-        parent(_parent), piter(_piter) { };
+    CDBIterator(const CDBWrapper& _parent, NedbIter* _piter)
+        : parent(_parent), piter(_piter) {}
     ~CDBIterator();
 
     bool Valid() const;
-
     void SeekToFirst();
 
-    template<typename K> void Seek(const K& key) {
+    template <typename K>
+    void Seek(const K& key)
+    {
         CDataStream ssKey(SER_DISK, CLIENT_VERSION);
         ssKey.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
         ssKey << key;
-        leveldb::Slice slKey(ssKey.data(), ssKey.size());
-        piter->Seek(slKey);
+        nedb_iter_seek(piter,
+                       reinterpret_cast<const unsigned char*>(ssKey.data()),
+                       ssKey.size());
     }
 
     void Next();
 
-    template<typename K> bool GetKey(K& key) {
-        leveldb::Slice slKey = piter->key();
+    template <typename K>
+    bool GetKey(K& key)
+    {
+        unsigned char* kptr  = nullptr;
+        size_t         klen  = 0;
+        if (nedb_iter_key(piter, &kptr, &klen) != 0) return false;
         try {
-            CDataStream ssKey(slKey.data(), slKey.data() + slKey.size(), SER_DISK, CLIENT_VERSION);
+            CDataStream ssKey(reinterpret_cast<char*>(kptr),
+                              reinterpret_cast<char*>(kptr) + klen,
+                              SER_DISK, CLIENT_VERSION);
             ssKey >> key;
         } catch (const std::exception&) {
+            nedb_free_value(kptr, klen);
             return false;
         }
+        nedb_free_value(kptr, klen);
         return true;
     }
 
-    template<typename V> bool GetValue(V& value) {
-        leveldb::Slice slValue = piter->value();
+    template <typename V>
+    bool GetValue(V& value)
+    {
+        unsigned char* vptr = nullptr;
+        size_t         vlen = 0;
+        if (nedb_iter_value(piter, &vptr, &vlen) != 0) return false;
         try {
-            CDataStream ssValue(slValue.data(), slValue.data() + slValue.size(), SER_DISK, CLIENT_VERSION);
+            CDataStream ssValue(reinterpret_cast<char*>(vptr),
+                                reinterpret_cast<char*>(vptr) + vlen,
+                                SER_DISK, CLIENT_VERSION);
+            // Obfuscation is a no-op (zero key) — kept for ABI compatibility.
             ssValue.Xor(dbwrapper_private::GetObfuscateKey(parent));
             ssValue >> value;
         } catch (const std::exception&) {
+            nedb_free_value(vptr, vlen);
             return false;
         }
+        nedb_free_value(vptr, vlen);
         return true;
     }
 
-    unsigned int GetValueSize() {
-        return piter->value().size();
+    unsigned int GetValueSize()
+    {
+        unsigned char* vptr = nullptr;
+        size_t         vlen = 0;
+        if (nedb_iter_value(piter, &vptr, &vlen) != 0) return 0;
+        nedb_free_value(vptr, vlen);
+        return static_cast<unsigned int>(vlen);
     }
-
 };
+
+// ---------------------------------------------------------------------------
+// CDBWrapper — NEDB-backed replacement for LevelDB CDBWrapper
+// ---------------------------------------------------------------------------
 
 class CDBWrapper
 {
-    friend const std::vector<unsigned char>& dbwrapper_private::GetObfuscateKey(const CDBWrapper &w);
+    friend const std::vector<unsigned char>&
+        dbwrapper_private::GetObfuscateKey(const CDBWrapper& w);
+
 private:
-    //! custom environment this database is using (may be nullptr in case of default environment)
-    leveldb::Env* penv;
+    //! NEDB database handle (replaces leveldb::DB* pdb)
+    NedbHandle* pdb;
 
-    //! database options used
-    leveldb::Options options;
-
-    //! options used when reading from the database
-    leveldb::ReadOptions readoptions;
-
-    //! options used when iterating over values of the database
-    leveldb::ReadOptions iteroptions;
-
-    //! options used when writing to the database
-    leveldb::WriteOptions writeoptions;
-
-    //! options used when sync writing to the database
-    leveldb::WriteOptions syncoptions;
-
-    //! the database itself
-    leveldb::DB* pdb;
-
-    //! the name of this database
+    //! The name / path of this database instance.
     std::string m_name;
 
-    //! a key used for optional XOR-obfuscation of the database
+    //! Obfuscation key — always zero for the NEDB backend.
+    //! NEDB uses AES-256-GCM (Phase 2, NEDB_TMK env var) instead.
+    //! Kept for compatibility with dbwrapper_private::GetObfuscateKey().
     std::vector<unsigned char> obfuscate_key;
 
-    //! the key under which the obfuscation key is stored
-    static const std::string OBFUSCATE_KEY_KEY;
-
-    //! the length of the obfuscate key in number of bytes
+    static const std::string  OBFUSCATE_KEY_KEY;
     static const unsigned int OBFUSCATE_KEY_NUM_BYTES;
 
     std::vector<unsigned char> CreateObfuscateKey() const;
 
 public:
     /**
-     * @param[in] path        Location in the filesystem where leveldb data will be stored.
-     * @param[in] nCacheSize  Configures various leveldb cache settings.
-     * @param[in] fMemory     If true, use leveldb's memory environment.
-     * @param[in] fWipe       If true, remove all existing data.
-     * @param[in] obfuscate   If true, store data obfuscated via simple XOR. If false, XOR
-     *                        with a zero'd byte array.
+     * @param path       Filesystem path for the NEDB data directory.
+     * @param nCacheSize Ignored (NEDB manages its own memory).
+     * @param fMemory    If true, use an in-memory store (no persistence).
+     * @param fWipe      If true, wipe existing data before opening.
+     * @param obfuscate  Ignored — NEDB uses AES-256-GCM, not XOR obfuscation.
      */
-    CDBWrapper(const fs::path& path, size_t nCacheSize, bool fMemory = false, bool fWipe = false, bool obfuscate = false);
+    CDBWrapper(const fs::path& path, size_t nCacheSize,
+               bool fMemory = false, bool fWipe = false, bool obfuscate = false);
     ~CDBWrapper();
 
-    CDBWrapper(const CDBWrapper&) = delete;
+    CDBWrapper(const CDBWrapper&)            = delete;
     CDBWrapper& operator=(const CDBWrapper&) = delete;
 
     template <typename K, typename V>
@@ -232,23 +267,28 @@ public:
         CDataStream ssKey(SER_DISK, CLIENT_VERSION);
         ssKey.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
         ssKey << key;
-        leveldb::Slice slKey(ssKey.data(), ssKey.size());
 
-        std::string strValue;
-        leveldb::Status status = pdb->Get(readoptions, slKey, &strValue);
-        if (!status.ok()) {
-            if (status.IsNotFound())
-                return false;
-            LogPrintf("LevelDB read failure: %s\n", status.ToString());
-            dbwrapper_private::HandleError(status);
+        unsigned char* vptr = nullptr;
+        size_t         vlen = 0;
+        int rc = nedb_get(pdb,
+                          reinterpret_cast<const unsigned char*>(ssKey.data()),
+                          ssKey.size(),
+                          &vptr, &vlen);
+        if (rc == 1) return false; // not found
+        if (rc != 0) {
+            throw dbwrapper_error("NEDB read failure for key in " + m_name);
         }
         try {
-            CDataStream ssValue(strValue.data(), strValue.data() + strValue.size(), SER_DISK, CLIENT_VERSION);
-            ssValue.Xor(obfuscate_key);
+            CDataStream ssValue(reinterpret_cast<char*>(vptr),
+                                reinterpret_cast<char*>(vptr) + vlen,
+                                SER_DISK, CLIENT_VERSION);
+            ssValue.Xor(obfuscate_key); // no-op (zero key)
             ssValue >> value;
         } catch (const std::exception&) {
+            nedb_free_value(vptr, vlen);
             return false;
         }
+        nedb_free_value(vptr, vlen);
         return true;
     }
 
@@ -266,17 +306,13 @@ public:
         CDataStream ssKey(SER_DISK, CLIENT_VERSION);
         ssKey.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
         ssKey << key;
-        leveldb::Slice slKey(ssKey.data(), ssKey.size());
-
-        std::string strValue;
-        leveldb::Status status = pdb->Get(readoptions, slKey, &strValue);
-        if (!status.ok()) {
-            if (status.IsNotFound())
-                return false;
-            LogPrintf("LevelDB read failure: %s\n", status.ToString());
-            dbwrapper_private::HandleError(status);
+        int rc = nedb_exists(pdb,
+                             reinterpret_cast<const unsigned char*>(ssKey.data()),
+                             ssKey.size());
+        if (rc < 0) {
+            throw dbwrapper_error("NEDB exists failure for key in " + m_name);
         }
-        return true;
+        return rc == 1;
     }
 
     template <typename K>
@@ -289,51 +325,41 @@ public:
 
     bool WriteBatch(CDBBatch& batch, bool fSync = false);
 
-    // Get an estimate of LevelDB memory usage (in bytes).
-    size_t DynamicMemoryUsage() const;
+    /** Returns approximate NEDB memory usage.
+     *  Phase 1: returns 0 (exact tracking deferred to Phase 2). */
+    size_t DynamicMemoryUsage() const { return 0; }
 
-    CDBIterator *NewIterator()
+    CDBIterator* NewIterator()
     {
-        return new CDBIterator(*this, pdb->NewIterator(iteroptions));
+        return new CDBIterator(*this, nedb_iter_new(pdb));
     }
 
-    /**
-     * Return true if the database managed by this class contains no entries.
-     */
+    /** Return true if the database contains no entries. */
     bool IsEmpty();
 
-    template<typename K>
-    size_t EstimateSize(const K& key_begin, const K& key_end) const
+    /** Returns an approximate size estimate for the key range [key_begin, key_end).
+     *  NEDB backend: returns 0 (size estimates are a LevelDB optimisation hint). */
+    template <typename K>
+    size_t EstimateSize(const K& /*key_begin*/, const K& /*key_end*/) const
     {
-        CDataStream ssKey1(SER_DISK, CLIENT_VERSION), ssKey2(SER_DISK, CLIENT_VERSION);
-        ssKey1.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
-        ssKey2.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
-        ssKey1 << key_begin;
-        ssKey2 << key_end;
-        leveldb::Slice slKey1(ssKey1.data(), ssKey1.size());
-        leveldb::Slice slKey2(ssKey2.data(), ssKey2.size());
-        uint64_t size = 0;
-        leveldb::Range range(slKey1, slKey2);
-        pdb->GetApproximateSizes(&range, 1, &size);
-        return size;
+        return 0;
     }
 
-    /**
-     * Compact a certain range of keys in the database.
-     */
-    template<typename K>
-    void CompactRange(const K& key_begin, const K& key_end) const
-    {
-        CDataStream ssKey1(SER_DISK, CLIENT_VERSION), ssKey2(SER_DISK, CLIENT_VERSION);
-        ssKey1.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
-        ssKey2.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
-        ssKey1 << key_begin;
-        ssKey2 << key_end;
-        leveldb::Slice slKey1(ssKey1.data(), ssKey1.size());
-        leveldb::Slice slKey2(ssKey2.data(), ssKey2.size());
-        pdb->CompactRange(&slKey1, &slKey2);
-    }
+    /** Compact a range of keys.
+     *  NEDB backend: no-op — the DAG engine manages its own storage layout. */
+    template <typename K>
+    void CompactRange(const K& /*key_begin*/, const K& /*key_end*/) const {}
 
+    /** Return the current BLAKE2b chain head (state root) as a hex string.
+     *  In Phase 2 this is the deterministic consensus proof: two nodes that
+     *  have processed the same chain will produce identical heads. */
+    std::string GetStateRoot() const
+    {
+        char* head = nedb_head(pdb);
+        std::string result(head ? head : "");
+        nedb_free_str(head);
+        return result;
+    }
 };
 
 #endif // BITCOIN_DBWRAPPER_H
