@@ -35,15 +35,11 @@
 
 namespace dbwrapper_private {
 
-// Zero-key obfuscation vector — NEDB uses AES-256-GCM encryption instead.
-// All XOR operations against this key are no-ops, preserving wire compatibility
-// with code that calls GetObfuscateKey() without needing actual XOR obfuscation.
-static const std::vector<unsigned char> kZeroObfuscateKey(
-    CDBWrapper::OBFUSCATE_KEY_NUM_BYTES, 0);
-
+// NEDB backend: obfuscation key is always the zero vector (XOR = no-op).
+// NEDB uses AES-256-GCM natively (NEDB_TMK env var, Phase 2).
+// We return w.obfuscate_key directly — it is always zero-filled on open.
 const std::vector<unsigned char>& GetObfuscateKey(const CDBWrapper& w)
 {
-    // Return the wrapper's own key (always zero for NEDB backend).
     return w.obfuscate_key;
 }
 

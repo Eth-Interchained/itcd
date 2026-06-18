@@ -29,13 +29,6 @@ use blake2::{Blake2b512, Digest};
 // Internal state
 // ---------------------------------------------------------------------------
 
-/// An individual pending write in a batch.
-#[derive(Clone)]
-struct BatchOp {
-    key: Vec<u8>,
-    value: Option<Vec<u8>>, // None = delete
-}
-
 /// Core in-process store (Phase 1: BTreeMap for ordered iteration).
 struct NedbInner {
     /// Main key-value store.  Keys are raw bytes; we preserve order for iter.
