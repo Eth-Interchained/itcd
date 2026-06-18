@@ -212,13 +212,14 @@ jobs:
           group_start = '-Wl,--start-group'
           group_end = '-Wl,--end-group'
           nedb = os.environ['NEDB_LIB']
+          rust_syslibs = '-ldl -lpthread -lm'
           replacements = {
               'interchainedd_LDADD = $(LIBBITCOIN_SERVER) $(interchained_bin_ldadd) $(NEDB_FFI_LA)':
-                  f'interchainedd_LDADD = {group_start} $(LIBBITCOIN_SERVER) $(interchained_bin_ldadd) {nedb} {group_end}',
+                  f'interchainedd_LDADD = {group_start} $(LIBBITCOIN_SERVER) $(interchained_bin_ldadd) {nedb} {rust_syslibs} {group_end}',
               'interchained_node_LDADD = $(LIBBITCOIN_SERVER) $(interchained_bin_ldadd) $(NEDB_FFI_LA)':
-                  f'interchained_node_LDADD = {group_start} $(LIBBITCOIN_SERVER) $(interchained_bin_ldadd) {nedb} {group_end}',
+                  f'interchained_node_LDADD = {group_start} $(LIBBITCOIN_SERVER) $(interchained_bin_ldadd) {nedb} {rust_syslibs} {group_end}',
               'interchained_wallet_LDADD = $(LIBBITCOIN_WALLET_TOOL) $(interchained_bin_ldadd) $(NEDB_FFI_LA)':
-                  f'interchained_wallet_LDADD = {group_start} $(LIBBITCOIN_WALLET_TOOL) $(interchained_bin_ldadd) {nedb} {group_end}',
+                  f'interchained_wallet_LDADD = {group_start} $(LIBBITCOIN_WALLET_TOOL) $(interchained_bin_ldadd) {nedb} {rust_syslibs} {group_end}',
           }
           for old, new in replacements.items():
               if old not in s:
