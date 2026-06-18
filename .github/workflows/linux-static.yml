@@ -67,7 +67,11 @@ jobs:
         run: |
           . "$HOME/.cargo/env"
           cd nedb-ffi
-          cargo build --release
+          # LTO must be disabled for ar x to produce usable native .o files.
+          # With lto=true, Rust emits LLVM bitcode fat objects; ar x extracts them
+          # but GNU ld cannot link bitcode — only the compiler-rt helpers (non-LTO)
+          # come out as native .o. CARGO_PROFILE_RELEASE_LTO overrides Cargo.toml.
+          CARGO_PROFILE_RELEASE_LTO=false cargo build --release
           echo "libnedb_ffi.a: $(du -sh target/release/libnedb_ffi.a | cut -f1)"
 
       - name: Generate libnedb_ffi.la libtool wrapper
