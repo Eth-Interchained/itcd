@@ -108,11 +108,11 @@ jobs:
           # Generate the libtool wrapper consumed by src/Makefile.am LDADD.
           # This keeps libnedb_ffi.a in the app link line without leaking it
           # into helper library links through global LIBS.
-          cat > target/release/libnedb_ffi.la <<'EOF'
-# libnedb_ffi.la - CI-generated libtool wrapper for Rust staticlib
-old_library='libnedb_ffi.a'
-libdir=''
-EOF
+          printf '%s\n' \
+            '# libnedb_ffi.la - CI-generated libtool wrapper for Rust staticlib' \
+            "old_library='libnedb_ffi.a'" \
+            "libdir=''" \
+            > target/release/libnedb_ffi.la
           test -f target/release/libnedb_ffi.la
       # ─────────────────────────────────────────────────────────────────────
 
