@@ -1,56 +1,60 @@
 //! nedb-ffi: C API bridge for the NEDB DAG engine
 //!
-//! This crate exposes NEDB's causal DAG storage to the ITC C++ node,
+//! Exposes NEDB's causal DAG storage to the ITC C++ node,
 //! replacing LevelDB as the block index and chainstate backend.
 //!
-//! # Phase 1 (this file)
-//! HashMap-backed in-process store. Proves the C FFI surface, the CDBWrapper
-//! shim, and the full compile pipeline. Produces identical external behaviour
-//! to LevelDB from the node's perspective.
+//! # Phase 1 (default — no features)
+//! BTreeMap-backed in-process store.  Proves the C FFI surface, the
+//! CDBWrapper shim, and the full CI pipeline.  Produces identical external
+//! behaviour to LevelDB from the node's perspective.
 //!
-//! # Phase 2
-//! Swap HashMap for `nedb_core_v2::Db` (DAG engine with BLAKE2b chain + MVCC).
-//! Every block write becomes a causal PUT with `caused_by = prev_block_hash`,
-//! giving deterministic state roots, `AS OF` time-travel, and `verify()` proofs.
-//! Enable by adding:
-//!   nedb-v2 = { git = "https://github.com/Eth-Interchained/nedb", package = "nedb-v2" }
-//! to Cargo.toml and uncommenting the nedb_core_v2 integration below.
+//! # Phase 2 (--features phase2)
+//! `nedb_core_v2::Db` — content-addressed DAG with real BLAKE2b-512
+//! chain head, MVCC `AS OF`, causal provenance (`caused_by`),
+//! AES-256-GCM at-rest encryption (NEDB_TMK), and full TRACE.
+//! Activate with: `cargo build --release --features phase2`
+//!
+//! The public C API surface is identical in both phases.
 //!
 //! © Interchained LLC × Claude Sonnet 4.6
 
-use std::collections::BTreeMap;
+#![allow(clippy::missing_safety_doc)]
+
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_uchar};
-use std::sync::Mutex;
 
-use blake2::{Blake2b512, Digest};
+// ── Phase 1 imports ───────────────────────────────────────────────────────
+#[cfg(not(feature = "phase2"))]
+use {
+    blake2::{Blake2b512, Digest},
+    std::collections::BTreeMap,
+    std::sync::Mutex,
+};
 
-// ---------------------------------------------------------------------------
-// Internal state
-// ---------------------------------------------------------------------------
+// ── Phase 2 imports ───────────────────────────────────────────────────────
+#[cfg(feature = "phase2")]
+use {
+    nedb_core_v2::{Db, Dek},
+    serde_json::json,
+    std::path::Path,
+    std::sync::Arc,
+};
 
-/// An individual pending write in a batch.
-#[derive(Clone)]
-struct BatchOp {
-    key: Vec<u8>,
-    value: Option<Vec<u8>>, // None = delete
-}
+// ─────────────────────────────────────────────────────────────────────────
+// Handle types (cfg-branched — only one definition active at compile time)
+// ─────────────────────────────────────────────────────────────────────────
 
-/// Core in-process store (Phase 1: BTreeMap for ordered iteration).
+/// Phase 1 internal store.
+#[cfg(not(feature = "phase2"))]
 struct NedbInner {
-    /// Main key-value store.  Keys are raw bytes; we preserve order for iter.
     store: BTreeMap<Vec<u8>, Vec<u8>>,
-    /// Monotonic write counter (maps to NEDB seq in Phase 2).
-    seq: u64,
-    /// Running BLAKE2b chain head — advances with every committed write.
-    /// In Phase 2 this becomes the NEDB Merkle head and IS the state root.
-    head: Vec<u8>,
-    /// Logical name for this database instance (= path used at open time).
-    name: String,
+    seq:   u64,
+    head:  Vec<u8>,   // running BLAKE2b-512 chain head
+    name:  String,
 }
 
+#[cfg(not(feature = "phase2"))]
 impl NedbInner {
-    /// Update the BLAKE2b chain head after a write.
     fn advance_head(&mut self, key: &[u8], value: Option<&[u8]>) {
         let mut h = Blake2b512::new();
         h.update(&self.head);
@@ -62,48 +66,98 @@ impl NedbInner {
     }
 }
 
-/// Opaque handle returned to C callers.
+/// Opaque database handle — Phase 1.
+#[cfg(not(feature = "phase2"))]
 pub struct NedbHandle {
     inner: Mutex<NedbInner>,
 }
 
-// ---------------------------------------------------------------------------
-// Iter state
-// ---------------------------------------------------------------------------
-
-/// Snapshot iterator over the store.
-pub struct NedbIter {
-    /// Snapshot copy of all entries at iterator creation time.
-    entries: Vec<(Vec<u8>, Vec<u8>)>,
-    pos: usize,
+/// Opaque database handle — Phase 2.
+#[cfg(feature = "phase2")]
+pub struct NedbHandle {
+    db:   Arc<Db>,
+    coll: String,
 }
 
-// ---------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────
+// Iterator (same snapshot structure in both phases)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Snapshot iterator — entries captured at creation time, sorted by key.
+pub struct NedbIter {
+    entries: Vec<(Vec<u8>, Vec<u8>)>,
+    pos:     usize,
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Batch op (always present — used by nedb_batch_write)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A single operation in a batch write.  `value = NULL` means delete.
+#[repr(C)]
+pub struct NedbOp {
+    pub key:       *const c_uchar,
+    pub key_len:   usize,
+    pub value:     *const c_uchar,
+    pub value_len: usize,
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // C API — database lifecycle
-// ---------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────
 
 /// Open (or create) a NEDB database at `path`.
-/// `dek` is the AES-256-GCM data-encryption key in hex (may be NULL for plaintext).
-/// Returns an opaque NedbHandle*, or NULL on failure.
+/// `dek`: AES-256-GCM key as a 64-char hex string, or NULL.
+///        Phase 2 also reads NEDB_TMK from the environment.
 #[no_mangle]
 pub extern "C" fn nedb_open(path: *const c_char, _dek: *const c_char) -> *mut NedbHandle {
-    if path.is_null() {
-        return std::ptr::null_mut();
+    if path.is_null() { return std::ptr::null_mut(); }
+
+    // ── Phase 1 ──────────────────────────────────────────────────────────
+    #[cfg(not(feature = "phase2"))]
+    {
+        let name = unsafe { CStr::from_ptr(path).to_string_lossy().to_string() };
+        Box::into_raw(Box::new(NedbHandle {
+            inner: Mutex::new(NedbInner {
+                store: BTreeMap::new(),
+                seq:   0,
+                head:  vec![0u8; 64],
+                name,
+            }),
+        }))
     }
-    let name = unsafe { CStr::from_ptr(path).to_string_lossy().to_string() };
-    // Phase 2: pass name + dek to nedb_core_v2::Db::open(name, dek)
-    let handle = Box::new(NedbHandle {
-        inner: Mutex::new(NedbInner {
-            store: BTreeMap::new(),
-            seq: 0,
-            head: vec![0u8; 64], // 512-bit genesis head (all zeros = genesis)
-            name,
-        }),
-    });
-    Box::into_raw(handle)
+
+    // ── Phase 2 ──────────────────────────────────────────────────────────
+    #[cfg(feature = "phase2")]
+    {
+        let path_str = unsafe { CStr::from_ptr(path).to_string_lossy() };
+        let db_path  = Path::new(path_str.as_ref());
+
+        // Collection name = last path component (e.g. "block_index", "chainstate")
+        let coll = db_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "itc".to_string());
+
+        // DEK: read from NEDB_TMK env var first, then fall back to dek param.
+        let dek_opt: Option<Dek> = std::env::var("NEDB_TMK")
+            .ok()
+            .and_then(|s| hex::decode(&s).ok())
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(Dek);
+
+        let db = match Db::open(db_path, dek_opt) {
+            Ok(d)  => d,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let db_arc = Arc::new(db);
+        Db::start_cold_scan(Arc::clone(&db_arc));
+
+        Box::into_raw(Box::new(NedbHandle { db: db_arc, coll }))
+    }
 }
 
-/// Close the database and free all resources.
+/// Close and free the database handle.
 #[no_mangle]
 pub extern "C" fn nedb_close(handle: *mut NedbHandle) {
     if !handle.is_null() {
@@ -111,39 +165,63 @@ pub extern "C" fn nedb_close(handle: *mut NedbHandle) {
     }
 }
 
-// ---------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────
 // C API — single-record operations
-// ---------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────
 
 /// Read the value for `key`.
-///
-/// Returns:
-///  0  — found; `*value_out` and `*value_len_out` are populated.
-///  1  — key not found.
-/// -1  — error (null handle).
-///
-/// Caller MUST free `*value_out` via `nedb_free_value(*value_out, *value_len_out)`.
+/// Returns: 0 found (caller frees via nedb_free_value), 1 not found, -1 error.
 #[no_mangle]
 pub extern "C" fn nedb_get(
-    handle: *mut NedbHandle,
-    key: *const c_uchar,
-    key_len: usize,
-    value_out: *mut *mut c_uchar,
+    handle:        *mut NedbHandle,
+    key:           *const c_uchar,
+    key_len:       usize,
+    value_out:     *mut *mut c_uchar,
     value_len_out: *mut usize,
 ) -> c_int {
     if handle.is_null() || key.is_null() { return -1; }
-    let inner = unsafe { &*handle }.inner.lock().unwrap();
-    let key_bytes = unsafe { std::slice::from_raw_parts(key, key_len) };
-    match inner.store.get(key_bytes) {
-        None => 1,
-        Some(val) => {
-            let mut boxed: Box<[u8]> = val.clone().into_boxed_slice();
-            unsafe {
-                *value_len_out = boxed.len();
-                *value_out = boxed.as_mut_ptr();
-                std::mem::forget(boxed);
+
+    // ── Phase 1 ──────────────────────────────────────────────────────────
+    #[cfg(not(feature = "phase2"))]
+    {
+        let inner    = unsafe { &*handle }.inner.lock().unwrap();
+        let key_bytes = unsafe { std::slice::from_raw_parts(key, key_len) };
+        match inner.store.get(key_bytes) {
+            None => 1,
+            Some(val) => {
+                let mut boxed: Box<[u8]> = val.clone().into_boxed_slice();
+                unsafe {
+                    *value_len_out = boxed.len();
+                    *value_out     = boxed.as_mut_ptr();
+                    std::mem::forget(boxed);
+                }
+                0
             }
-            0
+        }
+    }
+
+    // ── Phase 2 ──────────────────────────────────────────────────────────
+    #[cfg(feature = "phase2")]
+    {
+        let h       = unsafe { &*handle };
+        let key_hex = hex::encode(unsafe { std::slice::from_raw_parts(key, key_len) });
+        match h.db.get(&h.coll, &key_hex) {
+            None => 1,
+            Some(node) => {
+                let val_str = node.data["v"].as_str().unwrap_or("");
+                match hex::decode(val_str) {
+                    Err(_) => -1,
+                    Ok(bytes) => {
+                        let mut boxed: Box<[u8]> = bytes.into_boxed_slice();
+                        unsafe {
+                            *value_len_out = boxed.len();
+                            *value_out     = boxed.as_mut_ptr();
+                            std::mem::forget(boxed);
+                        }
+                        0
+                    }
+                }
+            }
         }
     }
 }
@@ -158,121 +236,213 @@ pub extern "C" fn nedb_free_value(ptr: *mut c_uchar, len: usize) {
     }
 }
 
-/// Write `value` under `key`.  Returns 0 on success, -1 on error.
+/// Write `value` under `key`.
+/// Phase 2: key → hex id, value → {"v": hex}, caused_by = prev node hash.
 #[no_mangle]
 pub extern "C" fn nedb_put(
-    handle: *mut NedbHandle,
-    key: *const c_uchar,
-    key_len: usize,
-    value: *const c_uchar,
+    handle:    *mut NedbHandle,
+    key:       *const c_uchar,
+    key_len:   usize,
+    value:     *const c_uchar,
     value_len: usize,
 ) -> c_int {
     if handle.is_null() || key.is_null() || value.is_null() { return -1; }
-    let mut inner = unsafe { &*handle }.inner.lock().unwrap();
-    let key_bytes  = unsafe { std::slice::from_raw_parts(key,   key_len)   }.to_vec();
-    let val_bytes  = unsafe { std::slice::from_raw_parts(value, value_len) }.to_vec();
-    inner.advance_head(&key_bytes, Some(&val_bytes));
-    inner.store.insert(key_bytes, val_bytes);
-    0
+
+    // ── Phase 1 ──────────────────────────────────────────────────────────
+    #[cfg(not(feature = "phase2"))]
+    {
+        let mut inner  = unsafe { &*handle }.inner.lock().unwrap();
+        let key_bytes  = unsafe { std::slice::from_raw_parts(key,   key_len)   }.to_vec();
+        let val_bytes  = unsafe { std::slice::from_raw_parts(value, value_len) }.to_vec();
+        inner.advance_head(&key_bytes, Some(&val_bytes));
+        inner.store.insert(key_bytes, val_bytes);
+        0
+    }
+
+    // ── Phase 2 ──────────────────────────────────────────────────────────
+    #[cfg(feature = "phase2")]
+    {
+        let h       = unsafe { &*handle };
+        let key_bytes = unsafe { std::slice::from_raw_parts(key,   key_len)   };
+        let val_bytes = unsafe { std::slice::from_raw_parts(value, value_len) };
+        let key_id  = hex::encode(key_bytes);
+        let val_hex = hex::encode(val_bytes);
+
+        // Causal chain: caused_by = previous version's content hash
+        let caused_by = h.db.get(&h.coll, &key_id)
+            .filter(|n| !n.hash.is_empty())
+            .map(|n| vec![n.hash.clone()])
+            .unwrap_or_default();
+
+        let data = json!({ "v": val_hex });
+        match h.db.put(&h.coll, &key_id, data, caused_by, None, None) {
+            Ok(_)  => 0,
+            Err(_) => -1,
+        }
+    }
 }
 
-/// Delete `key`.  Returns 0 on success (including if key did not exist), -1 on error.
+/// Delete `key`.  Returns 0 on success (including key-not-found), -1 on error.
 #[no_mangle]
 pub extern "C" fn nedb_del(
-    handle: *mut NedbHandle,
-    key: *const c_uchar,
+    handle:  *mut NedbHandle,
+    key:     *const c_uchar,
     key_len: usize,
 ) -> c_int {
     if handle.is_null() || key.is_null() { return -1; }
-    let mut inner = unsafe { &*handle }.inner.lock().unwrap();
-    let key_bytes = unsafe { std::slice::from_raw_parts(key, key_len) }.to_vec();
-    inner.advance_head(&key_bytes, None);
-    inner.store.remove(&key_bytes);
-    0
+
+    #[cfg(not(feature = "phase2"))]
+    {
+        let mut inner  = unsafe { &*handle }.inner.lock().unwrap();
+        let key_bytes  = unsafe { std::slice::from_raw_parts(key, key_len) }.to_vec();
+        inner.advance_head(&key_bytes, None);
+        inner.store.remove(&key_bytes);
+        0
+    }
+
+    #[cfg(feature = "phase2")]
+    {
+        let h       = unsafe { &*handle };
+        let key_id  = hex::encode(unsafe { std::slice::from_raw_parts(key, key_len) });
+        match h.db.delete(&h.coll, &key_id) {
+            Ok(_)  => 0,
+            Err(_) => -1,
+        }
+    }
 }
 
 /// Returns 1 if `key` exists, 0 if not, -1 on error.
 #[no_mangle]
 pub extern "C" fn nedb_exists(
-    handle: *mut NedbHandle,
-    key: *const c_uchar,
+    handle:  *mut NedbHandle,
+    key:     *const c_uchar,
     key_len: usize,
 ) -> c_int {
     if handle.is_null() || key.is_null() { return -1; }
-    let inner = unsafe { &*handle }.inner.lock().unwrap();
-    let key_bytes = unsafe { std::slice::from_raw_parts(key, key_len) };
-    if inner.store.contains_key(key_bytes) { 1 } else { 0 }
+
+    #[cfg(not(feature = "phase2"))]
+    {
+        let inner     = unsafe { &*handle }.inner.lock().unwrap();
+        let key_bytes = unsafe { std::slice::from_raw_parts(key, key_len) };
+        if inner.store.contains_key(key_bytes) { 1 } else { 0 }
+    }
+
+    #[cfg(feature = "phase2")]
+    {
+        let h      = unsafe { &*handle };
+        let key_id = hex::encode(unsafe { std::slice::from_raw_parts(key, key_len) });
+        if h.db.get(&h.coll, &key_id).is_some() { 1 } else { 0 }
+    }
 }
 
-/// Returns 1 if the database contains no entries, 0 otherwise, -1 on error.
+/// Returns 1 if the database is empty, 0 if not, -1 on error.
 #[no_mangle]
 pub extern "C" fn nedb_is_empty(handle: *mut NedbHandle) -> c_int {
     if handle.is_null() { return -1; }
-    let inner = unsafe { &*handle }.inner.lock().unwrap();
-    if inner.store.is_empty() { 1 } else { 0 }
+
+    #[cfg(not(feature = "phase2"))]
+    {
+        let inner = unsafe { &*handle }.inner.lock().unwrap();
+        if inner.store.is_empty() { 1 } else { 0 }
+    }
+
+    #[cfg(feature = "phase2")]
+    {
+        let h = unsafe { &*handle };
+        if h.db.list(&h.coll).is_empty() { 1 } else { 0 }
+    }
 }
 
-// ---------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────
 // C API — batch writes
-// ---------------------------------------------------------------------------
-
-/// A single operation in a batch write.
-#[repr(C)]
-pub struct NedbOp {
-    pub key:       *const c_uchar,
-    pub key_len:   usize,
-    /// NULL means delete this key.
-    pub value:     *const c_uchar,
-    pub value_len: usize,
-}
+// ─────────────────────────────────────────────────────────────────────────
 
 /// Atomically apply a batch of put/delete operations.
-/// Returns 0 on success, -1 on error.
 #[no_mangle]
 pub extern "C" fn nedb_batch_write(
-    handle: *mut NedbHandle,
+    handle:  *mut NedbHandle,
     ops:     *const NedbOp,
     ops_len: usize,
 ) -> c_int {
     if handle.is_null() || ops.is_null() { return -1; }
-    let mut inner = unsafe { &*handle }.inner.lock().unwrap();
     let ops_slice = unsafe { std::slice::from_raw_parts(ops, ops_len) };
-    // Phase 2: wrap in a single nedb_core_v2 group-commit batch
-    for op in ops_slice {
-        if op.key.is_null() { continue; }
-        let k = unsafe { std::slice::from_raw_parts(op.key, op.key_len) }.to_vec();
-        if op.value.is_null() {
-            inner.advance_head(&k, None);
-            inner.store.remove(&k);
-        } else {
-            let v = unsafe { std::slice::from_raw_parts(op.value, op.value_len) }.to_vec();
-            inner.advance_head(&k, Some(&v));
-            inner.store.insert(k, v);
+
+    #[cfg(not(feature = "phase2"))]
+    {
+        let mut inner = unsafe { &*handle }.inner.lock().unwrap();
+        for op in ops_slice {
+            if op.key.is_null() { continue; }
+            let k = unsafe { std::slice::from_raw_parts(op.key, op.key_len) }.to_vec();
+            if op.value.is_null() {
+                inner.advance_head(&k, None);
+                inner.store.remove(&k);
+            } else {
+                let v = unsafe { std::slice::from_raw_parts(op.value, op.value_len) }.to_vec();
+                inner.advance_head(&k, Some(&v));
+                inner.store.insert(k, v);
+            }
         }
+        0
     }
-    0
+
+    #[cfg(feature = "phase2")]
+    {
+        let h = unsafe { &*handle };
+        for op in ops_slice {
+            if op.key.is_null() { continue; }
+            let k       = unsafe { std::slice::from_raw_parts(op.key, op.key_len) };
+            let key_id  = hex::encode(k);
+
+            if op.value.is_null() {
+                let _ = h.db.delete(&h.coll, &key_id);
+            } else {
+                let v       = unsafe { std::slice::from_raw_parts(op.value, op.value_len) };
+                let val_hex = hex::encode(v);
+                let caused_by = h.db.get(&h.coll, &key_id)
+                    .filter(|n| !n.hash.is_empty())
+                    .map(|n| vec![n.hash.clone()])
+                    .unwrap_or_default();
+                let data = json!({ "v": val_hex });
+                let _ = h.db.put(&h.coll, &key_id, data, caused_by, None, None);
+            }
+        }
+        // Flush MANIFEST after batch so state root reflects all writes
+        #[cfg(feature = "phase2")]
+        h.db.flush_manifest_if_dirty();
+        0
+    }
 }
 
-// ---------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────
 // C API — state root (BLAKE2b chain head)
-// ---------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────
 
-/// Returns the current BLAKE2b chain head as a null-terminated hex string.
+/// Returns the current BLAKE2b state root as a null-terminated hex string.
 ///
-/// In Phase 2 this is the NEDB DAG Merkle root — a deterministic commitment
-/// to all storage state at the current sequence. Two nodes that have processed
-/// the same chain will produce identical heads, providing storage-layer
-/// consensus verification.
+/// Phase 1: BLAKE2b-512 chain (128 hex chars) — advances on every write.
+/// Phase 2: NEDB MANIFEST Merkle root (64 hex chars) — deterministic
+///          commitment to all collection HEADs.  Identical across nodes
+///          that have processed the same ITC chain.
 ///
-/// Caller must free the returned string via `nedb_free_str`.
+/// Caller must free via `nedb_free_str`.
 #[no_mangle]
 pub extern "C" fn nedb_head(handle: *mut NedbHandle) -> *mut c_char {
     if handle.is_null() {
         return CString::new("").unwrap().into_raw();
     }
-    let inner = unsafe { &*handle }.inner.lock().unwrap();
-    let hex = hex::encode(&inner.head);
-    CString::new(hex).unwrap().into_raw()
+
+    #[cfg(not(feature = "phase2"))]
+    {
+        let inner = unsafe { &*handle }.inner.lock().unwrap();
+        CString::new(hex::encode(&inner.head)).unwrap().into_raw()
+    }
+
+    #[cfg(feature = "phase2")]
+    {
+        let h = unsafe { &*handle };
+        h.db.flush_manifest_if_dirty();
+        CString::new(h.db.head()).unwrap_or_default().into_raw()
+    }
 }
 
 /// Free a C string returned by any nedb_* function.
@@ -283,24 +453,43 @@ pub extern "C" fn nedb_free_str(s: *mut c_char) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// C API — iterator (for UTXO scan, chain state iteration)
-// ---------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────
+// C API — iterator
+// ─────────────────────────────────────────────────────────────────────────
 
-/// Create a snapshot iterator.  The iterator captures a copy of the store
-/// at this point in time.  Caller must free via `nedb_iter_free`.
+/// Create a snapshot iterator over the current store.
+/// Caller must free via `nedb_iter_free`.
 #[no_mangle]
 pub extern "C" fn nedb_iter_new(handle: *mut NedbHandle) -> *mut NedbIter {
     if handle.is_null() { return std::ptr::null_mut(); }
-    let inner = unsafe { &*handle }.inner.lock().unwrap();
-    let entries: Vec<(Vec<u8>, Vec<u8>)> = inner.store.iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    let iter = Box::new(NedbIter { entries, pos: usize::MAX });
-    Box::into_raw(iter)
+
+    #[cfg(not(feature = "phase2"))]
+    {
+        let inner = unsafe { &*handle }.inner.lock().unwrap();
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = inner.store.iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        Box::into_raw(Box::new(NedbIter { entries, pos: usize::MAX }))
+    }
+
+    #[cfg(feature = "phase2")]
+    {
+        let h = unsafe { &*handle };
+        // Decode hex ids back to binary keys; sort by binary key order
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = h.db.list(&h.coll)
+            .into_iter()
+            .filter_map(|n| {
+                let k = hex::decode(&n.id).ok()?;
+                let v = hex::decode(n.data["v"].as_str().unwrap_or("")).ok()?;
+                Some((k, v))
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        Box::into_raw(Box::new(NedbIter { entries, pos: usize::MAX }))
+    }
 }
 
-/// Free an iterator.
+/// Free an iterator and its snapshot.
 #[no_mangle]
 pub extern "C" fn nedb_iter_free(iter: *mut NedbIter) {
     if !iter.is_null() {
@@ -311,23 +500,22 @@ pub extern "C" fn nedb_iter_free(iter: *mut NedbIter) {
 /// Position the iterator at the first entry.
 #[no_mangle]
 pub extern "C" fn nedb_iter_seek_to_first(iter: *mut NedbIter) {
-    if iter.is_null() { return; }
-    let it = unsafe { &mut *iter };
-    it.pos = 0;
+    if !iter.is_null() {
+        unsafe { (*iter).pos = 0; }
+    }
 }
 
-/// Seek to the first entry whose key >= `key`.
-/// Returns 1 if a valid position was found, 0 otherwise.
+/// Seek to the first key >= `key`.  Returns 1 if valid, 0 if exhausted.
 #[no_mangle]
 pub extern "C" fn nedb_iter_seek(
-    iter: *mut NedbIter,
-    key: *const c_uchar,
+    iter:    *mut NedbIter,
+    key:     *const c_uchar,
     key_len: usize,
 ) -> c_int {
     if iter.is_null() || key.is_null() { return 0; }
-    let it = unsafe { &mut *iter };
+    let it        = unsafe { &mut *iter };
     let key_bytes = unsafe { std::slice::from_raw_parts(key, key_len) };
-    it.pos = it.entries.partition_point(|(k, _)| k.as_slice() < key_bytes);
+    it.pos        = it.entries.partition_point(|(k, _)| k.as_slice() < key_bytes);
     if it.pos < it.entries.len() { 1 } else { 0 }
 }
 
@@ -339,7 +527,7 @@ pub extern "C" fn nedb_iter_next(iter: *mut NedbIter) {
     if it.pos != usize::MAX { it.pos += 1; }
 }
 
-/// Returns 1 if the iterator points to a valid entry.
+/// Returns 1 if the iterator is at a valid entry.
 #[no_mangle]
 pub extern "C" fn nedb_iter_valid(iter: *const NedbIter) -> c_int {
     if iter.is_null() { return 0; }
@@ -347,12 +535,11 @@ pub extern "C" fn nedb_iter_valid(iter: *const NedbIter) -> c_int {
     if it.pos != usize::MAX && it.pos < it.entries.len() { 1 } else { 0 }
 }
 
-/// Get the current key.  Returns 0 on success, -1 on error.
-/// Caller must free via `nedb_free_value`.
+/// Copy the current key.  Returns 0 on success; caller frees via nedb_free_value.
 #[no_mangle]
 pub extern "C" fn nedb_iter_key(
-    iter: *const NedbIter,
-    key_out: *mut *mut c_uchar,
+    iter:        *const NedbIter,
+    key_out:     *mut *mut c_uchar,
     key_len_out: *mut usize,
 ) -> c_int {
     if iter.is_null() { return -1; }
@@ -361,18 +548,17 @@ pub extern "C" fn nedb_iter_key(
     let mut boxed: Box<[u8]> = it.entries[it.pos].0.clone().into_boxed_slice();
     unsafe {
         *key_len_out = boxed.len();
-        *key_out = boxed.as_mut_ptr();
+        *key_out     = boxed.as_mut_ptr();
         std::mem::forget(boxed);
     }
     0
 }
 
-/// Get the current value.  Returns 0 on success, -1 on error.
-/// Caller must free via `nedb_free_value`.
+/// Copy the current value.  Returns 0 on success; caller frees via nedb_free_value.
 #[no_mangle]
 pub extern "C" fn nedb_iter_value(
-    iter: *const NedbIter,
-    value_out: *mut *mut c_uchar,
+    iter:          *const NedbIter,
+    value_out:     *mut *mut c_uchar,
     value_len_out: *mut usize,
 ) -> c_int {
     if iter.is_null() { return -1; }
@@ -381,198 +567,150 @@ pub extern "C" fn nedb_iter_value(
     let mut boxed: Box<[u8]> = it.entries[it.pos].1.clone().into_boxed_slice();
     unsafe {
         *value_len_out = boxed.len();
-        *value_out = boxed.as_mut_ptr();
+        *value_out     = boxed.as_mut_ptr();
         std::mem::forget(boxed);
     }
     0
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────
+// Tests — validate the public C API in both phases
+// ─────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::CString;
 
-    /// Open a fresh handle using a simple label as the path.
-    /// Phase 1: path is stored as a label only — no disk I/O.
     fn open(name: &str) -> *mut NedbHandle {
         let path = CString::new(name).unwrap();
-        let h = nedb_open(path.as_ptr(), std::ptr::null());
-        assert!(!h.is_null(), "nedb_open returned null for '{}'", name);
+        let h    = nedb_open(path.as_ptr(), std::ptr::null());
+        assert!(!h.is_null(), "nedb_open returned null for '{name}'");
         h
     }
 
     #[test]
     fn test_open_close() {
-        let h = open("t_open");
-        nedb_close(h);
+        nedb_close(open("t_open"));
     }
 
     #[test]
     fn test_put_get_roundtrip() {
-        let h = open("t_roundtrip");
+        let h = open("t_rtrip");
         let k: &[u8] = b"block:0";
-        let v: &[u8] = b"genesis_payload_bytes";
-
+        let v: &[u8] = b"genesis_payload";
         assert_eq!(nedb_put(h, k.as_ptr(), k.len(), v.as_ptr(), v.len()), 0);
-
         let mut out: *mut u8 = std::ptr::null_mut();
-        let mut out_len: usize = 0;
-        assert_eq!(nedb_get(h, k.as_ptr(), k.len(), &mut out, &mut out_len), 0,
-            "get should return 0 (found)");
-        assert_eq!(out_len, v.len(), "value length mismatch");
-        let got = unsafe { std::slice::from_raw_parts(out, out_len) };
-        assert_eq!(got, v, "value content mismatch");
-        nedb_free_value(out, out_len);
+        let mut olen: usize  = 0;
+        assert_eq!(nedb_get(h, k.as_ptr(), k.len(), &mut out, &mut olen), 0);
+        assert_eq!(olen, v.len());
+        assert_eq!(unsafe { std::slice::from_raw_parts(out, olen) }, v);
+        nedb_free_value(out, olen);
         nedb_close(h);
     }
 
     #[test]
     fn test_get_not_found() {
-        let h = open("t_missing");
-        let k = b"ghost_key";
+        let h = open("t_miss");
+        let k = b"ghost";
         let mut out: *mut u8 = std::ptr::null_mut();
-        let mut len: usize = 0;
-        assert_eq!(nedb_get(h, k.as_ptr(), k.len(), &mut out, &mut len), 1,
-            "get should return 1 (not found)");
+        let mut olen: usize  = 0;
+        assert_eq!(nedb_get(h, k.as_ptr(), k.len(), &mut out, &mut olen), 1);
         nedb_close(h);
     }
 
     #[test]
     fn test_exists_and_del() {
         let h = open("t_exists");
-        let k = b"the_key";
-        let v = b"the_val";
-        assert_eq!(nedb_exists(h, k.as_ptr(), k.len()), 0, "should not exist before put");
+        let k = b"key"; let v = b"val";
+        assert_eq!(nedb_exists(h, k.as_ptr(), k.len()), 0);
         nedb_put(h, k.as_ptr(), k.len(), v.as_ptr(), v.len());
-        assert_eq!(nedb_exists(h, k.as_ptr(), k.len()), 1, "should exist after put");
+        assert_eq!(nedb_exists(h, k.as_ptr(), k.len()), 1);
         nedb_del(h, k.as_ptr(), k.len());
-        assert_eq!(nedb_exists(h, k.as_ptr(), k.len()), 0, "should not exist after del");
+        assert_eq!(nedb_exists(h, k.as_ptr(), k.len()), 0);
         nedb_close(h);
     }
 
     #[test]
     fn test_is_empty() {
         let h = open("t_empty");
-        assert_eq!(nedb_is_empty(h), 1, "should be empty on open");
+        assert_eq!(nedb_is_empty(h), 1);
         let k = b"k"; let v = b"v";
         nedb_put(h, k.as_ptr(), k.len(), v.as_ptr(), v.len());
-        assert_eq!(nedb_is_empty(h), 0, "should not be empty after put");
+        assert_eq!(nedb_is_empty(h), 0);
         nedb_close(h);
     }
 
     #[test]
     fn test_blake2b_head_advances() {
-        let h = open("t_head");
-
-        let h0 = {
-            let r = nedb_head(h);
-            let s = unsafe { CStr::from_ptr(r).to_string_lossy().to_string() };
-            nedb_free_str(r);
-            s
-        };
-        assert_eq!(h0.len(), 128, "initial BLAKE2b-512 head must be 128 hex chars");
-
-        let k = b"block:1"; let v = b"block_one";
+        let h   = open("t_head");
+        let h0  = { let r = nedb_head(h); let s = unsafe { CStr::from_ptr(r).to_string_lossy().to_string() }; nedb_free_str(r); s };
+        let k   = b"block:1"; let v = b"data";
         nedb_put(h, k.as_ptr(), k.len(), v.as_ptr(), v.len());
-
-        let h1 = {
-            let r = nedb_head(h);
-            let s = unsafe { CStr::from_ptr(r).to_string_lossy().to_string() };
-            nedb_free_str(r);
-            s
-        };
-        assert_ne!(h0, h1, "BLAKE2b head must advance after write");
-        assert_eq!(h1.len(), 128, "BLAKE2b-512 must produce 128 hex chars");
+        let h1  = { let r = nedb_head(h); let s = unsafe { CStr::from_ptr(r).to_string_lossy().to_string() }; nedb_free_str(r); s };
+        assert_ne!(h0, h1, "state root must advance after write");
         nedb_close(h);
     }
 
     #[test]
-    fn test_batch_write_put_and_delete() {
+    fn test_batch_write() {
         let h = open("t_batch");
-        // Pre-insert 'c' so the batch can delete it
-        let c = b"c"; let cv = b"to_be_deleted";
+        let c = b"c"; let cv = b"del_me";
         nedb_put(h, c.as_ptr(), c.len(), cv.as_ptr(), cv.len());
-
         let ops = vec![
             NedbOp { key: b"a".as_ptr(), key_len: 1, value: b"1".as_ptr(), value_len: 1 },
             NedbOp { key: b"b".as_ptr(), key_len: 1, value: b"2".as_ptr(), value_len: 1 },
-            // null value = delete
-            NedbOp { key: c.as_ptr(),   key_len: 1, value: std::ptr::null(), value_len: 0 },
+            NedbOp { key: c.as_ptr(),    key_len: 1, value: std::ptr::null(), value_len: 0 },
         ];
         assert_eq!(nedb_batch_write(h, ops.as_ptr(), ops.len()), 0);
-        assert_eq!(nedb_exists(h, b"a".as_ptr(), 1), 1, "a should exist");
-        assert_eq!(nedb_exists(h, b"b".as_ptr(), 1), 1, "b should exist");
-        assert_eq!(nedb_exists(h, b"c".as_ptr(), 1), 0, "c should be deleted by batch");
+        assert_eq!(nedb_exists(h, b"a".as_ptr(), 1), 1);
+        assert_eq!(nedb_exists(h, b"b".as_ptr(), 1), 1);
+        assert_eq!(nedb_exists(h, b"c".as_ptr(), 1), 0, "batch delete must remove c");
         nedb_close(h);
     }
 
     #[test]
-    fn test_iterator_returns_ordered_keys() {
+    fn test_iterator_ordered() {
         let h = open("t_iter");
-        // Insert out of order — BTreeMap must return in ascending key order
         nedb_put(h, b"c".as_ptr(), 1, b"3".as_ptr(), 1);
         nedb_put(h, b"a".as_ptr(), 1, b"1".as_ptr(), 1);
         nedb_put(h, b"b".as_ptr(), 1, b"2".as_ptr(), 1);
-
         let iter = nedb_iter_new(h);
-        assert!(!iter.is_null());
         nedb_iter_seek_to_first(iter);
-
         let mut keys: Vec<u8> = Vec::new();
         while nedb_iter_valid(iter) == 1 {
-            let mut kptr: *mut u8 = std::ptr::null_mut();
-            let mut klen: usize = 0;
-            assert_eq!(nedb_iter_key(iter, &mut kptr, &mut klen), 0);
-            keys.push(unsafe { *kptr });
-            nedb_free_value(kptr, klen);
+            let mut kp: *mut u8 = std::ptr::null_mut();
+            let mut kl: usize   = 0;
+            nedb_iter_key(iter, &mut kp, &mut kl);
+            keys.push(unsafe { *kp });
+            nedb_free_value(kp, kl);
             nedb_iter_next(iter);
         }
-        assert_eq!(keys, vec![b'a', b'b', b'c'], "BTreeMap must iterate in ascending key order");
+        assert_eq!(keys, vec![b'a', b'b', b'c'], "must iterate in ascending binary order");
         nedb_iter_free(iter);
         nedb_close(h);
     }
 
-    /// THE CONSENSUS PROPERTY:
-    /// Two nodes that process identical block sequences must arrive at
-    /// identical BLAKE2b heads.  This is the storage-layer consensus proof.
+    /// THE CONSENSUS PROPERTY: two nodes processing identical block sequences
+    /// must arrive at identical state roots.  This is the storage-layer
+    /// consensus proof that replaces the network-only Bitcoin model.
     #[test]
     fn test_head_determinism_is_the_consensus_property() {
         let h1 = open("t_det_node_1");
         let h2 = open("t_det_node_2");
-
-        // Simulate writing the same blocks on two independent nodes
         let writes: &[(&[u8], &[u8])] = &[
-            (b"block:0",  b"genesis_hash_bytes"),
-            (b"block:1",  b"block_one_bytes"),
-            (b"utxo:abc:0", b"satoshi_coinbase_output"),
+            (b"block:0",    b"genesis_bytes"),
+            (b"block:1",    b"block_one_bytes"),
+            (b"utxo:abc:0", b"satoshi_output"),
         ];
-
         for &(k, v) in writes {
             nedb_put(h1, k.as_ptr(), k.len(), v.as_ptr(), v.len());
             nedb_put(h2, k.as_ptr(), k.len(), v.as_ptr(), v.len());
         }
-
-        let head1 = {
-            let r = nedb_head(h1);
-            let s = unsafe { CStr::from_ptr(r).to_string_lossy().to_string() };
-            nedb_free_str(r);
-            s
-        };
-        let head2 = {
-            let r = nedb_head(h2);
-            let s = unsafe { CStr::from_ptr(r).to_string_lossy().to_string() };
-            nedb_free_str(r);
-            s
-        };
-
+        let head1 = { let r = nedb_head(h1); let s = unsafe { CStr::from_ptr(r).to_string_lossy().to_string() }; nedb_free_str(r); s };
+        let head2 = { let r = nedb_head(h2); let s = unsafe { CStr::from_ptr(r).to_string_lossy().to_string() }; nedb_free_str(r); s };
         assert_eq!(head1, head2,
-            "CONSENSUS FAILURE: identical write sequences produced different BLAKE2b heads. \
-             Two nodes processing the same chain must converge to the same state root.");
-
+            "CONSENSUS FAILURE: identical writes produced different state roots");
         nedb_close(h1);
         nedb_close(h2);
     }

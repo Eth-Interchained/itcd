@@ -95,6 +95,29 @@ jobs:
             nedb-ffi/nedb.h
           if-no-files-found: error
 
+  # ── Phase 2 compile check (Linux only — confirms nedb_core_v2 wires in) ─
+  nedb-ffi-phase2:
+    name: nedb-ffi · phase2 compile check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            nedb-ffi/target
+          key: linux-cargo-phase2-${{ hashFiles('nedb-ffi/Cargo.toml') }}
+      - name: cargo build --features phase2
+        working-directory: nedb-ffi
+        run: cargo build --release --features phase2
+      - name: cargo test --features phase2
+        working-directory: nedb-ffi
+        run: cargo test --release --features phase2
+
   # ── Publish to GitHub Releases on v* tags ───────────────────────────────
   release:
     name: Publish GitHub Release

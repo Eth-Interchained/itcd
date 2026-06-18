@@ -7,36 +7,29 @@ license     = "MIT"
 
 [lib]
 name       = "nedb_ffi"
-# staticlib → links into itcd binary at build time
-# cdylib    → shared .so/.dylib for dynamic linking
 crate-type = ["staticlib", "cdylib"]
 
-# ── Phase 2 feature flag ───────────────────────────────────────────────────
-# Enable with: cargo build --release --features phase2
-#
+# ── Feature flags ─────────────────────────────────────────────────────────
 # Phase 1 (default): BTreeMap-backed in-process store.
-#   Proves the C FFI surface, CDBWrapper shim, and CI pipeline.
-#   Zero external dependencies beyond hex + blake2.
+#   Proves the C FFI seam and CI pipeline. Zero external database deps.
 #
-# Phase 2: nedb_core_v2::Db — real BLAKE2b chain head, MVCC AS OF,
-#   causal DAG (caused_by), AES-256-GCM via NEDB_TMK, full TRACE.
-#   One feature flag away from production.
+# Phase 2: nedb_core_v2::Db  — real BLAKE2b chain head, MVCC AS OF,
+#   causal DAG (caused_by), AES-256-GCM via NEDB_TMK, TRACE provenance.
+#   Activate: cargo build --release --features phase2
 [features]
 default = []
-phase2  = ["nedb-core-v2"]
+phase2  = ["nedb-core-v2", "serde_json"]
 
 # ── Dependencies ──────────────────────────────────────────────────────────
 [dependencies]
 hex    = "0.4"
-blake2 = "0.10"   # Phase 1 BLAKE2b chain head
+blake2 = "0.10"           # Phase 1 BLAKE2b state-root chain
 
-# Phase 2: real NEDB DAG engine.
-# Uncomment the dep below AND enable the phase2 feature to activate.
-# The crate lives in rust/nedb-v2/ inside the nedb engine repo.
+# Phase 2 — real NEDB DAG engine (optional, gated by phase2 feature)
 nedb-core-v2 = { git = "https://github.com/Eth-Interchained/nedb", package = "nedb-core-v2", optional = true }
+serde_json   = { version = "1", optional = true }
 
 [build-dependencies]
-# cbindgen auto-generates nedb.h from the #[no_mangle] exports in src/lib.rs
 cbindgen = "0.26"
 
 [profile.release]
