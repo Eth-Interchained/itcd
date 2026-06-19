@@ -297,6 +297,25 @@ workflows:
           NEDB_LIB="$(pwd)/nedb-ffi/target/x86_64-apple-darwin/release/libnedb_ffi.a"
           echo "LIBS += -Wl,-force_load,${NEDB_LIB} -lpthread" >> src/Makefile
 
+          # Makefile prerequisite checks for target/release/libnedb_ffi.la (native path).
+          # Stage the x86_64 library there and create the .la wrapper it requires.
+          mkdir -p "$(pwd)/nedb-ffi/target/release"
+          cp "$NEDB_LIB" "$(pwd)/nedb-ffi/target/release/libnedb_ffi.a"
+          printf '%s\n' \
+            "# libtool wrapper — x86_64 cross-compiled for Codemagic build" \
+            "dlname=''" \
+            "library_names=''" \
+            "old_library='libnedb_ffi.a'" \
+            "inherited_linker_flags=''" \
+            "dependency_libs='-lpthread'" \
+            "weak_library_names=''" \
+            "current=0" "age=0" "revision=0" \
+            "installed=no" "shouldnotlink=no" \
+            "dlopen=''" "dlpreopen=''" \
+            "libdir='$(pwd)/nedb-ffi/target/release'" \
+            > "$(pwd)/nedb-ffi/target/release/libnedb_ffi.la"
+          echo "NEDB .la staged at: $(pwd)/nedb-ffi/target/release/libnedb_ffi.la"
+
           arch -x86_64 make -j"$J"
           test -f src/interchainedd && file src/interchainedd
 
