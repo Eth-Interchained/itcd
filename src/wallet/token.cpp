@@ -117,7 +117,13 @@ CAmount TokenLedger::GovernanceBalance() const
 }
 void TokenLedger::RegisterToken(const std::string& token, const std::string& name, const std::string& symbol, uint8_t decimals, const std::string& owner, int64_t height)
 {
-    m_token_meta[token] = {name, symbol, decimals, owner, height};
+    TokenMeta meta;
+    meta.name = name;
+    meta.symbol = symbol;
+    meta.decimals = decimals;
+    meta.operator_wallet = owner;
+    meta.creation_height = height;
+    m_token_meta[token] = meta;
 }
 
 void TokenLedger::CreateToken(const std::string& wallet, const std::string& token, CAmount amount, const std::string& name, const std::string& symbol, uint8_t decimals, int64_t height)
@@ -759,7 +765,7 @@ bool TokenLedger::Load()
     LOCK(m_mutex);
 
     if (!g_token_db) {
-        g_token_db = std::make_unique<CDBWrapper>(GetDataDir() / "tokens", 1 << 20, false, false, true);
+        g_token_db = std::unique_ptr<CDBWrapper>(new CDBWrapper(GetDataDir() / "tokens", 1 << 20, false, false, true));
     }
 
     uint32_t version = 0;
@@ -825,7 +831,7 @@ bool TokenLedger::Flush() const
 {
     LOCK(m_mutex);
     if (!g_token_db) {
-        g_token_db = std::make_unique<CDBWrapper>(GetDataDir() / "tokens", 1 << 20, false, false, true);
+        g_token_db = std::unique_ptr<CDBWrapper>(new CDBWrapper(GetDataDir() / "tokens", 1 << 20, false, false, true));
     }
     TokenLedgerState state;
     state.balances = m_balances;
