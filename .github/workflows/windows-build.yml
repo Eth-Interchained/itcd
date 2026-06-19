@@ -1,0 +1,178 @@
+name: Windows Build (MinGW64)
+
+# Builds interchainedd.exe on Windows via MSYS2 MinGW64.
+# Mirrors the macOS x86_64 Codemagic workflow:
+#   - BDB 4.8 from source
+#   - NEDB FFI Rust staticlib (x86_64-pc-windows-gnu)
+#   - Boost from MSYS2 (1.85 compat fixes already in source)
+#   - No ZMQ / no miniupnpc for first-pass build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  windows-x86_64:
+    name: Windows x86_64 — interchainedd.exe
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up MSYS2 (MinGW64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            make
+            autoconf
+            automake
+            libtool
+            pkg-config
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-boost
+            mingw-w64-x86_64-libevent
+            mingw-w64-x86_64-sqlite3
+            mingw-w64-x86_64-zeromq
+            mingw-w64-x86_64-miniupnpc
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-zlib
+            perl
+
+      - name: Install Rust stable + x86_64-pc-windows-gnu target
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          source "$HOME/.cargo/env"
+          rustup target add x86_64-pc-windows-gnu
+
+      - name: Build NEDB FFI (x86_64-pc-windows-gnu)
+        run: |
+          source "$HOME/.cargo/env"
+          sed -i 's/^lto[[:space:]]*=.*/lto = false/' nedb-ffi/Cargo.toml
+          cd nedb-ffi
+          RUSTFLAGS="-C embed-bitcode=no" \
+            cargo rustc --release --crate-type=staticlib \
+            --target x86_64-pc-windows-gnu
+          echo "libnedb_ffi.a size: $(du -sh target/x86_64-pc-windows-gnu/release/libnedb_ffi.a | cut -f1)"
+          SYMS=$(nm target/x86_64-pc-windows-gnu/release/libnedb_ffi.a 2>/dev/null \
+            | grep -c ' T _nedb_' || echo 0)
+          echo "nedb_* T-symbols: $SYMS"
+          [ "$SYMS" -gt 0 ] || { echo "ERROR: no nedb_* T symbols"; exit 1; }
+
+      - name: Stage NEDB FFI .la at native release path
+        run: |
+          NEDB_X64="$(pwd)/nedb-ffi/target/x86_64-pc-windows-gnu/release/libnedb_ffi.a"
+          NEDB_NATIVE_DIR="$(pwd)/nedb-ffi/target/release"
+          mkdir -p "$NEDB_NATIVE_DIR"
+          cp "$NEDB_X64" "$NEDB_NATIVE_DIR/libnedb_ffi.a"
+          printf '%s\n' \
+            "# libtool wrapper — Windows x86_64 MinGW64" \
+            "dlname=''" \
+            "library_names=''" \
+            "old_library='libnedb_ffi.a'" \
+            "inherited_linker_flags=''" \
+            "dependency_libs='-lpthread -lws2_32 -lbcrypt -lntdll'" \
+            "weak_library_names=''" \
+            "current=0" "age=0" "revision=0" \
+            "installed=no" "shouldnotlink=no" \
+            "dlopen=''" "dlpreopen=''" \
+            "libdir='$NEDB_NATIVE_DIR'" \
+            > "$NEDB_NATIVE_DIR/libnedb_ffi.la"
+          echo "Staged: $NEDB_NATIVE_DIR/libnedb_ffi.la"
+          cat "$NEDB_NATIVE_DIR/libnedb_ffi.la"
+
+      - name: Build Berkeley DB 4.8 from source
+        run: |
+          set -euo pipefail
+          J=$(nproc || echo 4)
+          BDB_PREFIX="$GITHUB_WORKSPACE/db4"
+          mkdir -p "$BDB_PREFIX"
+
+          git clone --depth=1 https://github.com/observerdev/db-4.8.30.git /tmp/bdb-src
+
+          # Patch for modern compiler atomics
+          find /tmp/bdb-src -type f \( \
+            -name '*.h' -o -name '*.c' -o -name '*.cc' -o -name '*.cpp' \
+          \) -print0 | xargs -0 perl -pi -e \
+            's/\b__atomic_compare_exchange\b/__db_atomic_compare_exchange/g;
+             s/\batomic_init\s*\(/db_atomic_init(/g;'
+
+          cd /tmp/bdb-src/build_unix
+          ../dist/configure \
+            --prefix="$BDB_PREFIX" \
+            --enable-cxx \
+            --disable-shared \
+            --with-pic \
+            || { cat config.log; exit 1; }
+          make -j"$J"
+          make install
+
+          [ -f "$BDB_PREFIX/lib/libdb_cxx.a" ] && \
+            ln -sf "$BDB_PREFIX/lib/libdb_cxx.a" "$BDB_PREFIX/lib/libdb_cxx-4.8.a" || true
+          [ -f "$BDB_PREFIX/lib/libdb.a" ] && \
+            ln -sf "$BDB_PREFIX/lib/libdb.a" "$BDB_PREFIX/lib/libdb-4.8.a" || true
+
+          echo "BDB staged:"
+          ls -lah "$BDB_PREFIX/include/db"*.h 2>/dev/null || true
+          ls -lah "$BDB_PREFIX/lib/libdb"*.a  2>/dev/null || true
+
+      - name: Configure & Build interchainedd.exe
+        run: |
+          source "$HOME/.cargo/env"
+          J=$(nproc || echo 4)
+          BDB_PREFIX="$GITHUB_WORKSPACE/db4"
+
+          ./autogen.sh
+
+          BDB_CFLAGS="-I$BDB_PREFIX/include" \
+          BDB_LIBS="$BDB_PREFIX/lib/libdb_cxx-4.8.a $BDB_PREFIX/lib/libdb-4.8.a -pthread" \
+          ./configure \
+            --enable-wallet \
+            --with-incompatible-bdb \
+            --without-gui \
+            --disable-bench \
+            --disable-tests \
+            --without-zmq \
+            --without-miniupnpc \
+            || { cat config.log; exit 1; }
+
+          # GNU ld whole-archive (Windows equivalent of macOS -force_load)
+          NEDB_LIB="$(pwd)/nedb-ffi/target/release/libnedb_ffi.a"
+          echo "LIBS += -Wl,--whole-archive,${NEDB_LIB},--no-whole-archive -lws2_32 -lbcrypt -lntdll" \
+            >> src/Makefile
+
+          make -j"$J"
+          test -f src/interchainedd.exe && file src/interchainedd.exe
+
+      - name: Package Windows binary
+        run: |
+          REF="${GITHUB_REF_NAME:-${GITHUB_SHA:0:8}}"
+          mkdir -p out
+          cp src/interchainedd.exe   out/ 2>/dev/null || true
+          cp src/interchained-cli.exe out/ 2>/dev/null || true
+          [ -f README.md ] && cp README.md out/ || true
+          sha256sum out/* > out/SHA256SUMS
+          tar -C out -czf "interchained-windows-x86_64-${REF}.tar.gz" .
+          echo "Binary size: $(du -sh out/interchainedd.exe 2>/dev/null || echo 'not found')"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: interchained-windows-x86_64
+          path: interchained-windows-x86_64-*.tar.gz
+          if-no-files-found: error
