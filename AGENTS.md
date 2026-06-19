@@ -240,6 +240,28 @@ Fix pattern in `codemagic.yaml`:
 - Rename every `atomic_init(` call/macro to `db_atomic_init(`.
 - Fail early if a `#define atomic_init` line survives under `/tmp/bdb-src`.
 
+### 9. Codemagic macOS x86_64 configure could not find Boost::System
+
+Symptom:
+
+```text
+configure: error: Could not find a version of the Boost::System library!
+```
+
+Important subtlety:
+
+- Once Berkeley DB compiles, the next failing step is `Configure & Build interchainedd (x86_64 via Rosetta)`, not the BDB build step.
+- The noisy `db_cxx.h` misses in `config.log` can be configure probes; the fatal error is Boost::System.
+- Rosetta Homebrew installs x86_64 Boost under `/usr/local`, while the M2 host can still make probes look like arm64 unless compiler and linker flags force `-arch x86_64`.
+
+Fix pattern in `codemagic.yaml`:
+
+- Resolve `BOOST_PREFIX` with `arch -x86_64 /usr/local/bin/brew --prefix boost`.
+- Add `$BOOST_PREFIX/include` and `$BOOST_PREFIX/lib` to the x86_64 configure environment.
+- Set `CC="clang -arch x86_64"` and `CXX="clang++ -arch x86_64"`.
+- Include `-arch x86_64` in `CFLAGS`, `CXXFLAGS`, and `LDFLAGS`.
+- Pass `--with-boost="$BOOST_PREFIX"`, `--build=x86_64-apple-darwin`, and `--host=x86_64-apple-darwin` to configure.
+
 ## Current portable glibc link strategy
 
 The working strategy is layered:
@@ -285,6 +307,7 @@ This is intentionally CI-scoped because the portable packaging workflow is the p
 | `libnedb_ffi.a(...): undefined reference to dlsym` | Rust archive is linked, but native syslib missing | Rust syslibs in final link group |
 | `libdb_cxx headers missing` with `-I.../db4/include` present | BDB install prefix lacks `db_cxx.h` | `codemagic.yaml` BDB header staging/checks |
 | `#define atomic_init(p, val)` near libc++ `<atomic>` errors | BDB legacy atomic macro collided with Apple libc++ | `codemagic.yaml` BDB source rewrite before configure |
+| `Could not find a version of the Boost::System library` | x86_64 configure is not pointed at Rosetta Homebrew Boost or is probing the wrong arch | `codemagic.yaml` x86_64 configure Boost and `-arch x86_64` flags |
 | `no nedb_* T symbols` | Rust archive did not export expected FFI | `nedb-ffi/src/lib.rs`, Rust build flags, LTO/bitcode checks |
 | LLVM bitcode magic in extracted objects | Rust archive unusable by GNU ld path | `lto=false`, `RUSTFLAGS=-C embed-bitcode=no` |
 

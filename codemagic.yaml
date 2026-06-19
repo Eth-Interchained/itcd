@@ -241,19 +241,37 @@ workflows:
         script: |
           source "$HOME/.cargo/env"
           J=$(sysctl -n hw.logicalcpu || echo 4)
-          arch -x86_64 ./autogen.sh
-          export CPATH="$CM_BUILD_DIR/db4/include:${CPATH:-}"
-          export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
           export PATH="/usr/local/bin:$PATH"
+          export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/opt/openssl@3/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+          BOOST_PREFIX="$(arch -x86_64 /usr/local/bin/brew --prefix boost)"
+          echo "BOOST_PREFIX=$BOOST_PREFIX"
+
+          arch -x86_64 ./autogen.sh
+
+          export CPATH="$CM_BUILD_DIR/db4/include:$BOOST_PREFIX/include:/usr/local/include:${CPATH:-}"
+
           arch -x86_64 env \
-            CPPFLAGS="-I$CM_BUILD_DIR/db4/include" \
-            LDFLAGS="-L$CM_BUILD_DIR/db4/lib" \
-            CFLAGS="-O2" \
-            CXXFLAGS="-O2 -std=c++14" \
+            CC="clang -arch x86_64" \
+            CXX="clang++ -arch x86_64" \
+            CPPFLAGS="-I$CM_BUILD_DIR/db4/include -I$BOOST_PREFIX/include -I/usr/local/include" \
+            LDFLAGS="-arch x86_64 -L$CM_BUILD_DIR/db4/lib -L$BOOST_PREFIX/lib -L/usr/local/lib -Wl,-search_paths_first" \
+            CFLAGS="-O2 -arch x86_64" \
+            CXXFLAGS="-O2 -std=c++14 -arch x86_64" \
             BDB_LIBS="$CM_BUILD_DIR/db4/lib/libdb_cxx-4.8.a $CM_BUILD_DIR/db4/lib/libdb-4.8.a -pthread" \
             ./configure \
-              --enable-wallet --with-incompatible-bdb --without-gui \
-              --disable-bench --disable-tests --with-zmq --with-miniupnpc \
+              --build=x86_64-apple-darwin \
+              --host=x86_64-apple-darwin \
+              --enable-wallet \
+              --with-incompatible-bdb \
+              --with-boost="$BOOST_PREFIX" \
+              --without-gui \
+              --disable-bench \
+              --disable-tests \
+              --disable-asm \
+              --with-zmq \
+              --with-miniupnpc \
             || { cat config.log; exit 1; }
           NEDB_LIB="$(pwd)/nedb-ffi/target/x86_64-apple-darwin/release/libnedb_ffi.a"
           echo "LIBS += -Wl,-force_load,${NEDB_LIB} -lpthread" >> src/Makefile
