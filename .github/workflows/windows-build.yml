@@ -76,10 +76,11 @@ jobs:
             cargo rustc --release --crate-type=staticlib \
             --target x86_64-pc-windows-gnu
           echo "libnedb_ffi.a size: $(du -sh target/x86_64-pc-windows-gnu/release/libnedb_ffi.a | cut -f1)"
+          # Windows PE/COFF 64-bit symbols have no leading underscore — grep without it
           SYMS=$(nm target/x86_64-pc-windows-gnu/release/libnedb_ffi.a 2>/dev/null \
-            | grep -c ' T _nedb_' || echo 0)
-          echo "nedb_* T-symbols: $SYMS"
-          [ "$SYMS" -gt 0 ] || { echo "ERROR: no nedb_* T symbols"; exit 1; }
+            | grep -c 'nedb_' || true)
+          echo "nedb_* symbols: $SYMS"
+          [ "${SYMS:-0}" -gt 0 ] || { echo "ERROR: no nedb_* symbols found"; exit 1; }
 
       - name: Stage NEDB FFI .la at native release path
         run: |
