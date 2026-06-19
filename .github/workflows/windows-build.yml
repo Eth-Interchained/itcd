@@ -136,6 +136,8 @@ jobs:
           ./configure \
             --enable-wallet \
             --with-incompatible-bdb \
+            --with-boost=/mingw64 \
+            --with-boost-libdir=/mingw64/lib \
             --without-gui \
             --disable-bench \
             --disable-tests \
