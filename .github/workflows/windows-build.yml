@@ -122,6 +122,15 @@ jobs:
 
           ./autogen.sh
 
+          # Boost 1.74+ makes boost::system header-only. AX_BOOST_SYSTEM's link
+          # test fails on MinGW64 with Boost 1.91 (no stub to link against for the
+          # probe), leaving BOOST_SYSTEM_LIB="" which trips the configure.ac guard.
+          # Patch the generated configure to fall back to -lboost_system instead of
+          # aborting — the lib IS present at /mingw64/lib, we just need the fallback.
+          sed -i \
+            's/as_fn_error.*Could not find a version of the Boost::System library.*/BOOST_SYSTEM_LIB="-lboost_system" # MinGW64 header-only fallback/' \
+            configure
+
           BDB_CFLAGS="-I${BDB_PREFIX}/include" \
           BDB_LIBS="-L${BDB_PREFIX}/lib -ldb_cxx -ldb" \
           ./configure \
