@@ -194,10 +194,23 @@ workflows:
           BOOST_PREFIX="$(arch -x86_64 /usr/local/bin/brew --prefix boost@1.85)"
           echo "BOOST_PREFIX=$BOOST_PREFIX"
 
+          # Sanity: confirm Boost.System lib is present (fails fast before configure)
           ls -lah "$BOOST_PREFIX/lib" | grep boost_system || {
             echo "ERROR: boost@1.85 did not provide libboost_system"
             echo "Available boost libs:"
             ls -lah "$BOOST_PREFIX/lib" | head -100
+            exit 1
+          }
+
+          # Sanity: confirm BDB headers + libs are present from the build step above
+          test -f "$CM_BUILD_DIR/db4/include/db_cxx.h" || {
+            echo "ERROR: Missing db_cxx.h — BDB build may have failed"
+            find "$CM_BUILD_DIR/db4" -maxdepth 4 -type f | sort
+            exit 1
+          }
+          test -f "$CM_BUILD_DIR/db4/lib/libdb_cxx-4.8.a" || {
+            echo "ERROR: Missing libdb_cxx-4.8.a — BDB build may have failed"
+            find "$CM_BUILD_DIR/db4" -maxdepth 4 -type f | sort
             exit 1
           }
 
@@ -210,6 +223,7 @@ workflows:
             LDFLAGS="-arch x86_64 -L$CM_BUILD_DIR/db4/lib -L$BOOST_PREFIX/lib -L/usr/local/lib -Wl,-search_paths_first" \
             CFLAGS="-O2 -arch x86_64" \
             CXXFLAGS="-O2 -std=c++14 -arch x86_64" \
+            BDB_CFLAGS="-I$CM_BUILD_DIR/db4/include" \
             BDB_LIBS="$CM_BUILD_DIR/db4/lib/libdb_cxx-4.8.a $CM_BUILD_DIR/db4/lib/libdb-4.8.a -pthread" \
             ./configure \
               --build=x86_64-apple-darwin \
