@@ -167,50 +167,105 @@ workflows:
 
       - name: Build Berkeley DB 4.8 (x86_64 via Rosetta)
         script: |
+          set -euo pipefail
+
           J=$(sysctl -n hw.logicalcpu || echo 4)
+          BDB_PREFIX="$CM_BUILD_DIR/db4"
+
+          echo "BDB_PREFIX=$BDB_PREFIX"
+
+          rm -rf "$BDB_PREFIX" /tmp/bdb-src
+          mkdir -p "$BDB_PREFIX"
+
           git clone --depth=1 https://github.com/observerdev/db-4.8.30.git /tmp/bdb-src
-          sed -i '' 's/__atomic_compare_exchange/__db_atomic_compare_exchange/g' \
-            /tmp/bdb-src/dbinc/atomic.h
+
+          # Patch all BDB sources for modern Apple Clang atomics
+          find /tmp/bdb-src -type f \( \
+            -name '*.h' -o -name '*.c' -o -name '*.cc' -o -name '*.cpp' \
+          \) -print0 | xargs -0 perl -pi -e \
+            's/\b__atomic_compare_exchange\b/__db_atomic_compare_exchange/g;
+             s/\batomic_init\s*\(/db_atomic_init(/g;'
+
           cd /tmp/bdb-src/build_unix
-          arch -x86_64 env CFLAGS="-O2 -fPIC" \
+
+          arch -x86_64 env \
+            CC="clang -arch x86_64" \
+            CXX="clang++ -arch x86_64" \
+            CFLAGS="-O2 -fPIC -arch x86_64" \
+            CXXFLAGS="-O2 -fPIC -arch x86_64" \
             ../dist/configure \
-              --prefix="$CM_BUILD_DIR/db4" --enable-cxx --disable-shared --with-pic
+              --prefix="$BDB_PREFIX" \
+              --enable-cxx \
+              --disable-shared \
+              --with-pic \
+              --enable-posixmutexes \
+              --with-mutex=POSIX/pthreads/library \
+            || { cat config.log; exit 1; }
+
           arch -x86_64 make -j"$J"
           arch -x86_64 make install
-          ln -sf "$CM_BUILD_DIR/db4/lib/libdb_cxx.a" \
-                 "$CM_BUILD_DIR/db4/lib/libdb_cxx-4.8.a" 2>/dev/null || true
-          ln -sf "$CM_BUILD_DIR/db4/lib/libdb.a" \
-                 "$CM_BUILD_DIR/db4/lib/libdb-4.8.a"     2>/dev/null || true
+
+          # Force-stage headers if make install missed them
+          mkdir -p "$BDB_PREFIX/include"
+          for header in db.h db_cxx.h; do
+            if [ ! -f "$BDB_PREFIX/include/$header" ]; then
+              cp "/tmp/bdb-src/build_unix/$header" "$BDB_PREFIX/include/$header" 2>/dev/null \
+                || cp "/tmp/bdb-src/$header" "$BDB_PREFIX/include/$header"
+            fi
+          done
+
+          # Add include alias so configure can find <db/db_cxx.h> if needed
+          mkdir -p "$BDB_PREFIX/include/db"
+          ln -sf ../db.h    "$BDB_PREFIX/include/db/db.h"
+          ln -sf ../db_cxx.h "$BDB_PREFIX/include/db/db_cxx.h"
+
+          # Normalize static library names
+          mkdir -p "$BDB_PREFIX/lib"
+          [ -f "$BDB_PREFIX/lib/libdb_cxx.a" ] && \
+            ln -sf "$BDB_PREFIX/lib/libdb_cxx.a" "$BDB_PREFIX/lib/libdb_cxx-4.8.a" || true
+          [ -f "$BDB_PREFIX/lib/libdb.a" ] && \
+            ln -sf "$BDB_PREFIX/lib/libdb.a" "$BDB_PREFIX/lib/libdb-4.8.a" || true
+
+          echo "BDB staged files:"
+          find "$BDB_PREFIX" -maxdepth 4 \( -type f -o -type l \) | sort
+
+          test -f "$BDB_PREFIX/include/db_cxx.h" || {
+            echo "ERROR: missing $BDB_PREFIX/include/db_cxx.h"; exit 1; }
+          test -f "$BDB_PREFIX/lib/libdb_cxx-4.8.a" || {
+            echo "ERROR: missing $BDB_PREFIX/lib/libdb_cxx-4.8.a"; exit 1; }
+          test -f "$BDB_PREFIX/lib/libdb-4.8.a" || {
+            echo "ERROR: missing $BDB_PREFIX/lib/libdb-4.8.a"; exit 1; }
+
+          lipo -info "$BDB_PREFIX/lib/libdb_cxx-4.8.a" || true
+          lipo -info "$BDB_PREFIX/lib/libdb-4.8.a" || true
 
       - name: Configure & Build interchainedd (x86_64 via Rosetta)
         script: |
+          set -euo pipefail
+
           source "$HOME/.cargo/env"
+
           J=$(sysctl -n hw.logicalcpu || echo 4)
+          BDB_PREFIX="$CM_BUILD_DIR/db4"
+          BOOST_PREFIX="$(arch -x86_64 /usr/local/bin/brew --prefix boost@1.85)"
 
           export PATH="/usr/local/bin:$PATH"
-          export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/opt/openssl@3/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          export PKG_CONFIG_PATH="/usr/local/opt/sqlite/lib/pkgconfig:/usr/local/lib/pkgconfig:/usr/local/opt/openssl@3/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
-          # boost@1.85 provides libboost_system — modern boost does not
-          BOOST_PREFIX="$(arch -x86_64 /usr/local/bin/brew --prefix boost@1.85)"
+          echo "BDB_PREFIX=$BDB_PREFIX"
           echo "BOOST_PREFIX=$BOOST_PREFIX"
 
-          # Sanity: confirm Boost.System lib is present (fails fast before configure)
-          ls -lah "$BOOST_PREFIX/lib" | grep boost_system || {
-            echo "ERROR: boost@1.85 did not provide libboost_system"
-            echo "Available boost libs:"
-            ls -lah "$BOOST_PREFIX/lib" | head -100
-            exit 1
-          }
+          echo "--- Preflight BDB ---"
+          find "$BDB_PREFIX" -maxdepth 4 \( -type f -o -type l \) | sort
 
-          # Sanity: confirm BDB headers + libs are present from the build step above
-          test -f "$CM_BUILD_DIR/db4/include/db_cxx.h" || {
-            echo "ERROR: Missing db_cxx.h — BDB build may have failed"
-            find "$CM_BUILD_DIR/db4" -maxdepth 4 -type f | sort
-            exit 1
-          }
-          test -f "$CM_BUILD_DIR/db4/lib/libdb_cxx-4.8.a" || {
-            echo "ERROR: Missing libdb_cxx-4.8.a — BDB build may have failed"
-            find "$CM_BUILD_DIR/db4" -maxdepth 4 -type f | sort
+          test -f "$BDB_PREFIX/include/db_cxx.h"
+          test -f "$BDB_PREFIX/lib/libdb_cxx-4.8.a"
+          test -f "$BDB_PREFIX/lib/libdb-4.8.a"
+
+          echo "--- Preflight Boost ---"
+          ls -lah "$BOOST_PREFIX/lib" | grep boost_system || {
+            echo "ERROR: boost@1.85 missing libboost_system"
+            ls -lah "$BOOST_PREFIX/lib" | head -50
             exit 1
           }
 
@@ -219,12 +274,12 @@ workflows:
           arch -x86_64 env \
             CC="clang -arch x86_64" \
             CXX="clang++ -arch x86_64" \
-            CPPFLAGS="-I$CM_BUILD_DIR/db4/include -I$BOOST_PREFIX/include -I/usr/local/include" \
-            LDFLAGS="-arch x86_64 -L$CM_BUILD_DIR/db4/lib -L$BOOST_PREFIX/lib -L/usr/local/lib -Wl,-search_paths_first" \
+            CPPFLAGS="-I$BDB_PREFIX/include -I$BOOST_PREFIX/include -I/usr/local/include" \
+            LDFLAGS="-arch x86_64 -L$BDB_PREFIX/lib -L$BOOST_PREFIX/lib -L/usr/local/lib -Wl,-search_paths_first" \
             CFLAGS="-O2 -arch x86_64" \
             CXXFLAGS="-O2 -std=c++14 -arch x86_64" \
-            BDB_CFLAGS="-I$CM_BUILD_DIR/db4/include" \
-            BDB_LIBS="$CM_BUILD_DIR/db4/lib/libdb_cxx-4.8.a $CM_BUILD_DIR/db4/lib/libdb-4.8.a -pthread" \
+            BDB_CFLAGS="-I$BDB_PREFIX/include" \
+            BDB_LIBS="$BDB_PREFIX/lib/libdb_cxx-4.8.a $BDB_PREFIX/lib/libdb-4.8.a -pthread" \
             ./configure \
               --build=x86_64-apple-darwin \
               --host=x86_64-apple-darwin \
