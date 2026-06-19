@@ -55,27 +55,9 @@ workflows:
       - name: Build Berkeley DB 4.8 from source
         script: |
           J=$(sysctl -n hw.logicalcpu || echo 4)
-          rm -rf /tmp/bdb-src
           git clone --depth=1 https://github.com/observerdev/db-4.8.30.git /tmp/bdb-src
-
-          # Patch Berkeley DB 4.8 for modern Apple Clang / libc++.
-          # Fixes:
-          # - __atomic_compare_exchange compiler builtin collision
-          # - atomic_init macro collision with libc++ <atomic>
-          find /tmp/bdb-src -type f \( \
-            -name '*.h' -o \
-            -name '*.c' -o \
-            -name '*.cc' -o \
-            -name '*.cpp' \
-          \) -print0 | xargs -0 perl -pi -e '
-            s/\b__atomic_compare_exchange\b/__db_atomic_compare_exchange/g;
-            s/\batomic_init\s*\(/db_atomic_init(/g;
-          '
-
-          if grep -R "^[[:space:]]*#define[[:space:]]\+atomic_init" /tmp/bdb-src; then
-            echo "ERROR: Berkeley DB atomic_init macro survived patch"
-            exit 1
-          fi
+          sed -i '' 's/__atomic_compare_exchange/__db_atomic_compare_exchange/g' \
+            /tmp/bdb-src/dbinc/atomic.h
           cd /tmp/bdb-src/build_unix
           CFLAGS="-O2 -fPIC" ../dist/configure \
             --prefix="$CM_BUILD_DIR/db4" --enable-cxx --disable-shared --with-pic
@@ -151,11 +133,14 @@ workflows:
       - name: Install build deps (x86_64 Homebrew via Rosetta)
         # Homebrew on Apple Silicon installs to /opt/homebrew.
         # For x86_64 builds we use the Rosetta-compatible path /usr/local.
+        # Pin boost@1.85: modern Boost (1.89+) removed libboost_system stub lib,
+        # but the old Bitcoin autoconf macro requires a physical libboost_system.
         script: |
           arch -x86_64 /bin/bash -c "
             /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\" 2>/dev/null || true
+            /usr/local/bin/brew update
             /usr/local/bin/brew install autoconf automake libtool pkg-config \
-              boost libevent miniupnpc zeromq sqlite
+              boost@1.85 libevent miniupnpc zeromq sqlite
           "
           echo 'export PATH="/usr/local/bin:$PATH"' >> "$HOME/.profile"
 
@@ -183,59 +168,19 @@ workflows:
       - name: Build Berkeley DB 4.8 (x86_64 via Rosetta)
         script: |
           J=$(sysctl -n hw.logicalcpu || echo 4)
-          rm -rf /tmp/bdb-src
           git clone --depth=1 https://github.com/observerdev/db-4.8.30.git /tmp/bdb-src
-
-          # Patch Berkeley DB 4.8 for modern Apple Clang / libc++.
-          # Fixes:
-          # - __atomic_compare_exchange compiler builtin collision
-          # - atomic_init macro collision with libc++ <atomic>
-          find /tmp/bdb-src -type f \( \
-            -name '*.h' -o \
-            -name '*.c' -o \
-            -name '*.cc' -o \
-            -name '*.cpp' \
-          \) -print0 | xargs -0 perl -pi -e '
-            s/\b__atomic_compare_exchange\b/__db_atomic_compare_exchange/g;
-            s/\batomic_init\s*\(/db_atomic_init(/g;
-          '
-
-          if grep -R "^[[:space:]]*#define[[:space:]]\+atomic_init" /tmp/bdb-src; then
-            echo "ERROR: Berkeley DB atomic_init macro survived patch"
-            exit 1
-          fi
+          sed -i '' 's/__atomic_compare_exchange/__db_atomic_compare_exchange/g' \
+            /tmp/bdb-src/dbinc/atomic.h
           cd /tmp/bdb-src/build_unix
           arch -x86_64 env CFLAGS="-O2 -fPIC" \
             ../dist/configure \
-              --prefix="$CM_BUILD_DIR/db4" --enable-cxx --disable-shared --with-pic \
-              --enable-posixmutexes --with-mutex=POSIX/pthreads/library \
-            || { cat config.log; exit 1; }
+              --prefix="$CM_BUILD_DIR/db4" --enable-cxx --disable-shared --with-pic
           arch -x86_64 make -j"$J"
           arch -x86_64 make install
-          # Some Rosetta builds install the static libraries but omit headers from
-          # the configured prefix. Stage them explicitly so the wallet configure
-          # check can find <db_cxx.h> under $CM_BUILD_DIR/db4/include.
-          mkdir -p "$CM_BUILD_DIR/db4/include"
-          for header in db.h db_cxx.h; do
-            if [ ! -f "$CM_BUILD_DIR/db4/include/$header" ]; then
-              cp "/tmp/bdb-src/build_unix/$header" "$CM_BUILD_DIR/db4/include/$header" 2>/dev/null \
-                || cp "/tmp/bdb-src/$header" "$CM_BUILD_DIR/db4/include/$header"
-            fi
-          done
-          test -f "$CM_BUILD_DIR/db4/include/db_cxx.h" || {
-            echo "ERROR: Berkeley DB C++ header missing after install"
-            find "$CM_BUILD_DIR/db4" -maxdepth 3 -type f | sort
-            exit 1
-          }
           ln -sf "$CM_BUILD_DIR/db4/lib/libdb_cxx.a" \
                  "$CM_BUILD_DIR/db4/lib/libdb_cxx-4.8.a" 2>/dev/null || true
           ln -sf "$CM_BUILD_DIR/db4/lib/libdb.a" \
                  "$CM_BUILD_DIR/db4/lib/libdb-4.8.a"     2>/dev/null || true
-          test -f "$CM_BUILD_DIR/db4/lib/libdb_cxx-4.8.a" || {
-            echo "ERROR: Berkeley DB C++ static library missing after install"
-            find "$CM_BUILD_DIR/db4" -maxdepth 3 -type f | sort
-            exit 1
-          }
 
       - name: Configure & Build interchainedd (x86_64 via Rosetta)
         script: |
@@ -245,12 +190,18 @@ workflows:
           export PATH="/usr/local/bin:$PATH"
           export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/opt/openssl@3/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
-          BOOST_PREFIX="$(arch -x86_64 /usr/local/bin/brew --prefix boost)"
+          # boost@1.85 provides libboost_system — modern boost does not
+          BOOST_PREFIX="$(arch -x86_64 /usr/local/bin/brew --prefix boost@1.85)"
           echo "BOOST_PREFIX=$BOOST_PREFIX"
 
-          arch -x86_64 ./autogen.sh
+          ls -lah "$BOOST_PREFIX/lib" | grep boost_system || {
+            echo "ERROR: boost@1.85 did not provide libboost_system"
+            echo "Available boost libs:"
+            ls -lah "$BOOST_PREFIX/lib" | head -100
+            exit 1
+          }
 
-          export CPATH="$CM_BUILD_DIR/db4/include:$BOOST_PREFIX/include:/usr/local/include:${CPATH:-}"
+          arch -x86_64 ./autogen.sh
 
           arch -x86_64 env \
             CC="clang -arch x86_64" \
@@ -273,8 +224,10 @@ workflows:
               --with-zmq \
               --with-miniupnpc \
             || { cat config.log; exit 1; }
+
           NEDB_LIB="$(pwd)/nedb-ffi/target/x86_64-apple-darwin/release/libnedb_ffi.a"
           echo "LIBS += -Wl,-force_load,${NEDB_LIB} -lpthread" >> src/Makefile
+
           arch -x86_64 make -j"$J"
           test -f src/interchainedd && file src/interchainedd
 
