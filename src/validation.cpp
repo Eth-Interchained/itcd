@@ -4332,7 +4332,7 @@ bool BlockManager::LoadBlockIndex(
             CBlockIndex* p = pindex->pprev;
             while (p && p->pprev == nullptr && p->nHeight > 0) {
                 CDiskBlockIndex di;
-                if (!blocktree.Read(std::make_pair(DB_BLOCK_INDEX, p->GetBlockHash()), di)) break;
+                if (!blocktree.ReadBlockIndex(p->GetBlockHash(), di)) break;
                 p->pprev          = InsertBlockIndex(di.hashPrev);
                 p->nHeight        = di.nHeight;
                 p->nFile          = di.nFile;
