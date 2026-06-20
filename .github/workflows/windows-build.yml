@@ -146,10 +146,40 @@ jobs:
             --without-miniupnpc \
             || { cat config.log; exit 1; }
 
-          # GNU ld whole-archive (Windows equivalent of macOS -force_load)
+          # Scope the Rust staticlib to the NEDB-consuming app links only.
+          # Do not append it to global LIBS: that leaks the archive into consensus,
+          # cli, and tx links, producing duplicate MinGW import symbols and invalid
+          # libtool .la handling. Whole-archive is also intentionally avoided here;
+          # it forces Rust's bundled import objects into the link and conflicts with
+          # MinGW system import libraries.
           NEDB_LIB="$(pwd)/nedb-ffi/target/release/libnedb_ffi.a"
-          echo "LIBS += -Wl,--whole-archive,${NEDB_LIB},--no-whole-archive -lws2_32 -lbcrypt -lntdll" \
-            >> src/Makefile
+          export NEDB_LIB
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          p = Path('src/Makefile')
+          s = p.read_text()
+          nedb = os.environ['NEDB_LIB']
+          rust_syslibs = '-lws2_32 -lbcrypt -luserenv -lntdll'
+          group_start = '-Wl,--start-group'
+          group_end = '-Wl,--end-group'
+          replacements = {
+              'interchainedd_LDADD = $(LIBBITCOIN_SERVER) $(interchained_bin_ldadd) $(NEDB_FFI_LA)':
+                  f'interchainedd_LDADD = {group_start} $(LIBBITCOIN_SERVER) $(interchained_bin_ldadd) {nedb} {rust_syslibs} {group_end}',
+              'interchained_node_LDADD = $(LIBBITCOIN_SERVER) $(interchained_bin_ldadd) $(NEDB_FFI_LA)':
+                  f'interchained_node_LDADD = {group_start} $(LIBBITCOIN_SERVER) $(interchained_bin_ldadd) {nedb} {rust_syslibs} {group_end}',
+              'interchained_wallet_LDADD = $(LIBBITCOIN_WALLET_TOOL) $(interchained_bin_ldadd) $(NEDB_FFI_LA)':
+                  f'interchained_wallet_LDADD = {group_start} $(LIBBITCOIN_WALLET_TOOL) $(interchained_bin_ldadd) {nedb} {rust_syslibs} {group_end}',
+          }
+          for old, new in replacements.items():
+              if old not in s:
+                  raise SystemExit(f'missing expected Makefile line: {old}')
+              s = s.replace(old, new, 1)
+          p.write_text(s)
+          PY
+          grep '^LIBS = ' src/Makefile | grep -v 'libnedb_ffi\.a'
+          grep '^interchainedd_LDADD = .*--start-group.*libnedb_ffi\.a.*-luserenv.*--end-group' src/Makefile
 
           make -j"$J"
           test -f src/interchainedd.exe && file src/interchainedd.exe

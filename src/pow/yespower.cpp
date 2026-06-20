@@ -6,7 +6,6 @@
 #include "pow.h"
 #include "pow/yespower.h"
 #include "hash.h"
-#include "chainparams.h" // Needed for Params()
 #include <serialize.h>       // For SER_NETWORK, etc.
 #include <streams.h>         // ✅ Required for CVectorWriter
 #include <logging.h>
@@ -56,7 +55,6 @@ uint256 YespowerHash(const CBlockHeader& block, int height)
 uint256 YespowerHash(const CBlockHeader& block, yespower_local_t* shared, int height)
 {
     uint256 hash;
-    const Consensus::Params& params = Params().GetConsensus();
     const yespower_params_t* algo = (height >= 1) ? &yespower_interchained : &yespower_default;
 
     // 🪙 Hash exactly as originally mined (80 bytes)
@@ -74,8 +72,6 @@ bool CheckYespower(const CBlockHeader& block, const arith_uint256& bnTarget, int
     const yespower_params_t* algo = (height >= 1)
         ? &yespower_interchained
         : &yespower_default;
-
-    const Consensus::Params& params = Params().GetConsensus();
 
     if (yespower_tls((const uint8_t*)&block, sizeof(CBlockHeader), algo, (yespower_binary_t*)&hash) != 0)
         return false;
