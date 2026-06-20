@@ -54,18 +54,56 @@ workflows:
 
       - name: Build Berkeley DB 4.8 from source
         script: |
+          set -euo pipefail
           J=$(sysctl -n hw.logicalcpu || echo 4)
+          BDB_PREFIX="$CM_BUILD_DIR/db4"
+          rm -rf "$BDB_PREFIX" /tmp/bdb-src
+          mkdir -p "$BDB_PREFIX"
+
           git clone --depth=1 https://github.com/observerdev/db-4.8.30.git /tmp/bdb-src
-          sed -i '' 's/__atomic_compare_exchange/__db_atomic_compare_exchange/g' \
-            /tmp/bdb-src/dbinc/atomic.h
+
+          # Patch all BDB sources for modern Apple Clang atomics (same as x86_64 step)
+          find /tmp/bdb-src -type f \( \
+            -name '*.h' -o -name '*.c' -o -name '*.cc' -o -name '*.cpp' \
+          \) -print0 | xargs -0 perl -pi -e \
+            's/\b__atomic_compare_exchange\b/__db_atomic_compare_exchange/g;
+             s/\batomic_init\s*\(/db_atomic_init(/g;'
+
           cd /tmp/bdb-src/build_unix
-          CFLAGS="-O2 -fPIC" ../dist/configure \
-            --prefix="$CM_BUILD_DIR/db4" --enable-cxx --disable-shared --with-pic
-          make -j"$J" && make install
-          ln -sf "$CM_BUILD_DIR/db4/lib/libdb_cxx.a" \
-                 "$CM_BUILD_DIR/db4/lib/libdb_cxx-4.8.a" 2>/dev/null || true
-          ln -sf "$CM_BUILD_DIR/db4/lib/libdb.a" \
-                 "$CM_BUILD_DIR/db4/lib/libdb-4.8.a"     2>/dev/null || true
+
+          # --enable-posixmutexes / --with-mutex=POSIX/pthreads/library: required on
+          # modern macOS (26+) where BDB 4.8's mutex auto-detection fails.
+          CFLAGS="-O2 -fPIC" CXXFLAGS="-O2 -fPIC" \
+          ../dist/configure \
+            --prefix="$BDB_PREFIX" \
+            --enable-cxx \
+            --disable-shared \
+            --with-pic \
+            --enable-posixmutexes \
+            --with-mutex=POSIX/pthreads/library \
+          || { cat config.log; exit 1; }
+
+          make -j"$J"
+          make install
+
+          # Force-stage headers if make install missed them
+          mkdir -p "$BDB_PREFIX/include"
+          for header in db.h db_cxx.h; do
+            if [ ! -f "$BDB_PREFIX/include/$header" ]; then
+              cp "/tmp/bdb-src/build_unix/$header" "$BDB_PREFIX/include/$header" 2>/dev/null \
+                || cp "/tmp/bdb-src/$header" "$BDB_PREFIX/include/$header"
+            fi
+          done
+
+          # Normalize lib names
+          mkdir -p "$BDB_PREFIX/lib"
+          [ -f "$BDB_PREFIX/lib/libdb_cxx.a" ] && \
+            ln -sf "$BDB_PREFIX/lib/libdb_cxx.a" "$BDB_PREFIX/lib/libdb_cxx-4.8.a" || true
+          [ -f "$BDB_PREFIX/lib/libdb.a" ] && \
+            ln -sf "$BDB_PREFIX/lib/libdb.a" "$BDB_PREFIX/lib/libdb-4.8.a" || true
+
+          echo "BDB staged at $BDB_PREFIX"
+          ls -lah "$BDB_PREFIX/include/db"*.h "$BDB_PREFIX/lib/libdb"*.a 2>/dev/null || true
 
       - name: Configure & Build interchainedd (arm64)
         script: |
