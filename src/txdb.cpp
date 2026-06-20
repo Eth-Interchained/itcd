@@ -27,6 +27,7 @@ static const char DB_HEAD_BLOCKS = 'H';
 static const char DB_FLAG = 'F';
 static const char DB_REINDEX_FLAG = 'R';
 static const char DB_LAST_BLOCK = 'l';
+static const char DB_CHAIN_WORK_TIP = 'W';  //!< Persisted tip nChainWork for fast warm restart
 
 namespace {
 
@@ -217,6 +218,17 @@ void CCoinsViewDBCursor::Next()
     } else {
         keyTmp.first = entry.key;
     }
+}
+
+bool CBlockTreeDB::WriteTipChainWork(const arith_uint256& chainwork) {
+    return Write(DB_CHAIN_WORK_TIP, ArithToUint256(chainwork));
+}
+
+bool CBlockTreeDB::ReadTipChainWork(arith_uint256& chainwork) {
+    uint256 raw;
+    if (!Read(DB_CHAIN_WORK_TIP, raw)) return false;
+    chainwork = UintToArith256(raw);
+    return true;
 }
 
 bool CBlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockFileInfo*> >& fileInfo, int nLastFile, const std::vector<const CBlockIndex*>& blockinfo) {
