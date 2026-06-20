@@ -113,6 +113,7 @@ public:
     bool ReadTipHash(uint256& hash);
     bool LoadBlockIndexFromTip(const uint256& tip_hash, int depth,
                                std::function<CBlockIndex*(const uint256&)> insertBlockIndex);
+    bool ReadBlockIndex(const uint256& hash, CDiskBlockIndex& diskindex);
 };
 
 #endif // BITCOIN_TXDB_H
