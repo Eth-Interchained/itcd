@@ -172,9 +172,12 @@ jobs:
           #
           # Boost is still in LIBS so cli/tx/wallet can find it.
           NEDB_LIB="$(pwd)/nedb-ffi/target/release/libnedb_ffi.a"
-          echo "interchainedd_LDADD += -Wl,--allow-multiple-definition -Wl,--whole-archive,${NEDB_LIB},--no-whole-archive -lbcrypt -lntdll -luserenv -lsodium" \
+          # --whole-archive only on interchainedd (force-load all NEDB symbols).
+          # Windows API deps go in LIBS so every NEDB-linked target gets them
+          # (interchainedd + interchained-wallet both link libnedb_ffi).
+          echo "interchainedd_LDADD += -Wl,--allow-multiple-definition -Wl,--whole-archive,${NEDB_LIB},--no-whole-archive" \
             >> src/Makefile
-          echo "LIBS += -lboost_thread-mt -lboost_chrono-mt -lboost_filesystem-mt -lws2_32" \
+          echo "LIBS += -lboost_thread-mt -lboost_chrono-mt -lboost_filesystem-mt -lws2_32 -lbcrypt -lntdll -luserenv -lsodium" \
             >> src/Makefile
 
           make -j"$J"
