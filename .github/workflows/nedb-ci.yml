@@ -7,11 +7,7 @@ name: nedb-ffi CI / Release
 # Phase 2: cargo build --features phase2  (nedb_core_v2::Db — uncomment dep in Cargo.toml)
 
 on:
-  push:
-    branches: ['**']
-    tags:     ['v*']
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
