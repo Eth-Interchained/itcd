@@ -288,6 +288,10 @@ bool CBlockTreeDB::LoadBlockIndexFromTip(
     return loaded > 0;
 }
 
+bool CBlockTreeDB::ReadBlockIndex(const uint256& hash, CDiskBlockIndex& diskindex) {
+    return Read(std::make_pair(DB_BLOCK_INDEX, hash), diskindex);
+}
+
 bool CBlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockFileInfo*> >& fileInfo, int nLastFile, const std::vector<const CBlockIndex*>& blockinfo) {
     CDBBatch batch(*this);
     for (std::vector<std::pair<int, const CBlockFileInfo*> >::const_iterator it=fileInfo.begin(); it != fileInfo.end(); it++) {
