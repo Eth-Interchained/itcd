@@ -122,13 +122,16 @@ jobs:
 
           ./autogen.sh
 
-          # Boost 1.74+ makes boost::system header-only. AX_BOOST_SYSTEM's link
-          # test fails on MinGW64 with Boost 1.91 (no stub to link against for the
-          # probe), leaving BOOST_SYSTEM_LIB="" which trips the configure.ac guard.
-          # Patch the generated configure to fall back to -lboost_system instead of
-          # aborting — the lib IS present at /mingw64/lib, we just need the fallback.
+          # Boost 1.74+ made boost::system / boost::filesystem header-only.
+          # The AX_BOOST_* link probes fail on MinGW64 with Boost 1.91 (nothing
+          # to link against for the probe), leaving BOOST_*_LIB="" which trips
+          # configure.ac's guards. Patch every Boost lib guard to fall back to
+          # the real library name — the .a files ARE present at /mingw64/lib.
           sed -i \
-            's/as_fn_error.*Could not find a version of the Boost::System library.*/BOOST_SYSTEM_LIB="-lboost_system" # MinGW64 header-only fallback/' \
+            -e 's/as_fn_error.*Could not find a version of the Boost::System library.*/BOOST_SYSTEM_LIB="-lboost_system"/' \
+            -e 's/as_fn_error.*Could not find a version of the Boost::Filesystem library.*/BOOST_FILESYSTEM_LIB="-lboost_filesystem"/' \
+            -e 's/as_fn_error.*Could not find a version of the Boost::Thread library.*/BOOST_THREAD_LIB="-lboost_thread -lboost_chrono"/' \
+            -e 's/as_fn_error.*Could not find a version of the Boost::Chrono library.*/BOOST_CHRONO_LIB="-lboost_chrono"/' \
             configure
 
           BDB_CFLAGS="-I${BDB_PREFIX}/include" \
