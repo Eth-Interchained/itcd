@@ -243,77 +243,126 @@ bool CBlockTreeDB::ReadFlag(const std::string &name, bool &fValue) {
     return true;
 }
 
-bool CBlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, std::function<CBlockIndex*(const uint256&)> insertBlockIndex)
+// Context passed into the nedb_scan callback for block index loading.
+struct LoadIndexCtx {
+    const Consensus::Params*                          consensusParams;
+    std::function<CBlockIndex*(const uint256&)>*      insertBlockIndex;
+    bool                                              error_flag;
+    std::string                                       error_msg;
+};
+
+// nedb_scan callback — invoked once per stored block index entry.
+// Replaces the old iterator loop: NEDB delivers entries in batches and
+// provides a running progress counter so we can log meaningful startup output
+// instead of a silent hang.
+static void LoadIndexCallback(
+    const unsigned char* key,   size_t key_len,
+    const unsigned char* val,   size_t val_len,
+    uint64_t progress, uint64_t total,
+    void* ctx_ptr)
 {
-    std::unique_ptr<CDBIterator> pcursor(NewIterator());
+    auto* ctx = static_cast<LoadIndexCtx*>(ctx_ptr);
+    if (ctx->error_flag) return;   // stop processing after first error
 
-    pcursor->Seek(std::make_pair(DB_BLOCK_INDEX, uint256()));
-
-    // Load m_block_index
-    while (pcursor->Valid()) {
-        if (ShutdownRequested()) return false;
-        std::pair<char, uint256> key;
-        if (pcursor->GetKey(key) && key.first == DB_BLOCK_INDEX) {
-            CDiskBlockIndex diskindex;
-            if (pcursor->GetValue(diskindex)) {
-                // Construct block index object
-                CBlockIndex* pindexNew = insertBlockIndex(diskindex.GetBlockHash());
-                pindexNew->pprev          = insertBlockIndex(diskindex.hashPrev);
-                pindexNew->nHeight        = diskindex.nHeight;
-                pindexNew->nFile          = diskindex.nFile;
-                pindexNew->nDataPos       = diskindex.nDataPos;
-                pindexNew->nUndoPos       = diskindex.nUndoPos;
-                pindexNew->nVersion       = diskindex.nVersion;
-                pindexNew->hashMerkleRoot = diskindex.hashMerkleRoot;
-                pindexNew->nTime          = diskindex.nTime;
-                pindexNew->nBits          = diskindex.nBits;
-                pindexNew->nNonce         = diskindex.nNonce;
-                pindexNew->nStatus        = diskindex.nStatus;
-                pindexNew->nTx            = diskindex.nTx;
-                
-                CBlockHeader dummyHeader;
-                dummyHeader.nBits = pindexNew->nBits;
-                dummyHeader.nTime = pindexNew->nTime;
-                dummyHeader.hashPrevBlock = pindexNew->pprev ? pindexNew->pprev->GetBlockHash() : uint256();
-                dummyHeader.hashMerkleRoot = pindexNew->hashMerkleRoot;
-                dummyHeader.nVersion = pindexNew->nVersion;
-                dummyHeader.nNonce = pindexNew->nNonce;
-                                
-                // Skip PoW recomputation for blocks already validated during IBD.
-                // BLOCK_VALID_TREE is the status set when difficulty, timestamp,
-                // and proof-of-work have been verified for a block. Any block in
-                // our local store at or above this level was already proven valid —
-                // re-hashing every block on every restart is redundant and
-                // expensive (YespowerHash is memory-hard by design, ~7-10ms/block,
-                // which adds up to 45-90 minutes at 350k blocks on a cold disk).
-                // Only verify PoW for blocks not yet validated to TREE level
-                // (orphan stubs or partially-processed blocks from interrupted IBD).
-                // The chain tip's PoW is verified separately after the full load.
-                if ((pindexNew->nStatus & BLOCK_VALID_MASK) < BLOCK_VALID_TREE) {
-                    uint256 powHash;
-                    if (pindexNew->nHeight >= consensusParams.sha256ReactivationHeight) {
-                        powHash = pindexNew->GetBlockHash();
-                    } else if (pindexNew->nHeight >= 1) {
-                        powHash = dummyHeader.YespowerHash(pindexNew->nHeight);
-                    } else {
-                        powHash = pindexNew->GetBlockHash();
-                    }
-                    int64_t prevBlockTime = (pindexNew->pprev && pindexNew->pprev->nTime != 0)
-                                              ? pindexNew->pprev->nTime
-                                              : -1;
-                    if (!CheckProofOfWork(powHash, dummyHeader, pindexNew->nBits, consensusParams, pindexNew->nHeight, prevBlockTime)) {
-                        return error("%s: CheckProofOfWork failed: %s", __func__, pindexNew->ToString());
-                    }
-                }
-                pcursor->Next();
-            } else {
-                return error("%s: failed to read value", __func__);
-            }
-        } else {
-            break;
-        }
+    // Log progress every 10 000 entries so the operator knows startup is alive.
+    if (progress == 1 || progress % 10000 == 0) {
+        if (total > 0)
+            LogPrintf("LoadBlockIndex: %llu / %llu (%.0f%%)\n",
+                      (unsigned long long)progress,
+                      (unsigned long long)total,
+                      100.0 * (double)progress / (double)total);
+        else
+            LogPrintf("LoadBlockIndex: %llu block headers...\n",
+                      (unsigned long long)progress);
     }
 
+    // Deserialise the key: (DB_BLOCK_INDEX prefix byte, uint256 block hash).
+    // The key was serialised by CDBWrapper::Write via CDataStream.
+    std::pair<char, uint256> db_key;
+    try {
+        CDataStream ks(reinterpret_cast<const char*>(key),
+                       reinterpret_cast<const char*>(key) + key_len,
+                       SER_DISK, CLIENT_VERSION);
+        ks >> db_key;
+    } catch (...) { return; }   // skip malformed keys
+
+    if (db_key.first != DB_BLOCK_INDEX) return;   // skip non-block-index entries
+
+    // Deserialise the value: CDiskBlockIndex.
+    CDiskBlockIndex diskindex;
+    try {
+        CDataStream vs(reinterpret_cast<const char*>(val),
+                       reinterpret_cast<const char*>(val) + val_len,
+                       SER_DISK, CLIENT_VERSION);
+        vs >> diskindex;
+    } catch (...) { return; }
+
+    // Construct CBlockIndex in the in-memory map.
+    auto& insert = *ctx->insertBlockIndex;
+    CBlockIndex* pindexNew = insert(diskindex.GetBlockHash());
+    pindexNew->pprev          = insert(diskindex.hashPrev);
+    pindexNew->nHeight        = diskindex.nHeight;
+    pindexNew->nFile          = diskindex.nFile;
+    pindexNew->nDataPos       = diskindex.nDataPos;
+    pindexNew->nUndoPos       = diskindex.nUndoPos;
+    pindexNew->nVersion       = diskindex.nVersion;
+    pindexNew->hashMerkleRoot = diskindex.hashMerkleRoot;
+    pindexNew->nTime          = diskindex.nTime;
+    pindexNew->nBits          = diskindex.nBits;
+    pindexNew->nNonce         = diskindex.nNonce;
+    pindexNew->nStatus        = diskindex.nStatus;
+    pindexNew->nTx            = diskindex.nTx;
+
+    // Only recheck PoW for blocks not yet validated to BLOCK_VALID_TREE.
+    // Already-validated blocks are trusted from our local store.
+    if ((pindexNew->nStatus & BLOCK_VALID_MASK) < BLOCK_VALID_TREE) {
+        CBlockHeader dummyHeader;
+        dummyHeader.nBits          = pindexNew->nBits;
+        dummyHeader.nTime          = pindexNew->nTime;
+        dummyHeader.hashPrevBlock  = pindexNew->pprev ? pindexNew->pprev->GetBlockHash() : uint256();
+        dummyHeader.hashMerkleRoot = pindexNew->hashMerkleRoot;
+        dummyHeader.nVersion       = pindexNew->nVersion;
+        dummyHeader.nNonce         = pindexNew->nNonce;
+
+        uint256 powHash;
+        if (pindexNew->nHeight >= ctx->consensusParams->sha256ReactivationHeight)
+            powHash = pindexNew->GetBlockHash();
+        else if (pindexNew->nHeight >= 1)
+            powHash = dummyHeader.YespowerHash(pindexNew->nHeight);
+        else
+            powHash = pindexNew->GetBlockHash();
+
+        int64_t prevBlockTime = (pindexNew->pprev && pindexNew->pprev->nTime != 0)
+                                    ? pindexNew->pprev->nTime : -1;
+        if (!CheckProofOfWork(powHash, dummyHeader, pindexNew->nBits,
+                              *ctx->consensusParams, pindexNew->nHeight, prevBlockTime)) {
+            ctx->error_flag = true;
+            ctx->error_msg  = strprintf("CheckProofOfWork failed: %s", pindexNew->ToString());
+        }
+    }
+}
+
+bool CBlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, std::function<CBlockIndex*(const uint256&)> insertBlockIndex)
+{
+    LogPrintf("LoadBlockIndex: scanning NEDB block index...\n");
+
+    LoadIndexCtx ctx;
+    ctx.consensusParams  = &consensusParams;
+    ctx.insertBlockIndex = &insertBlockIndex;
+    ctx.error_flag       = false;
+
+    if (ShutdownRequested()) return false;
+
+    // nedb_scan delivers every stored entry via callback with a live progress
+    // counter — no more silent hang at startup.
+    // pdb is the NedbHandle* inherited from CDBWrapper.
+    uint64_t scanned = nedb_scan(pdb, LoadIndexCallback, &ctx);
+
+    if (ctx.error_flag)
+        return error("%s: %s", __func__, ctx.error_msg);
+
+    LogPrintf("LoadBlockIndex: loaded %llu block index entries.\n",
+              (unsigned long long)scanned);
     return true;
 }
 
