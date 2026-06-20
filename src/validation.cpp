@@ -4330,7 +4330,10 @@ bool BlockManager::LoadBlockIndex(
         // fetching from NEDB until BuildSkip() has the full ancestor chain.
         if (pindex->pprev) {
             CBlockIndex* p = pindex->pprev;
-            while (p && p->pprev == nullptr && p->nHeight > 0) {
+            // nStatus == 0 identifies an unloaded stub (default CBlockIndex).
+            // Real blocks always have nStatus set from disk — walk stops when
+            // we reach a loaded block or genesis.
+            while (p && p->nStatus == 0) {
                 CDiskBlockIndex di;
                 if (!blocktree.ReadBlockIndex(p->GetBlockHash(), di)) break;
                 p->pprev          = InsertBlockIndex(di.hashPrev);
