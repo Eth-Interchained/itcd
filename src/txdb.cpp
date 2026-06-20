@@ -356,7 +356,7 @@ bool CBlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, 
     // nedb_scan delivers every stored entry via callback with a live progress
     // counter — no more silent hang at startup.
     // pdb is the NedbHandle* inherited from CDBWrapper.
-    uint64_t scanned = nedb_scan(pdb, LoadIndexCallback, &ctx);
+    uint64_t scanned = nedb_scan(GetHandle(), LoadIndexCallback, &ctx);
 
     if (ctx.error_flag)
         return error("%s: %s", __func__, ctx.error_msg);
