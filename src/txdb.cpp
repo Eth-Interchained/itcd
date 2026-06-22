@@ -312,7 +312,7 @@ bool CBlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockF
     }
     if (pBestInBatch) {
         batch.Write(DB_TIP_HASH,       pBestInBatch->GetBlockHash());
-        batch.Write(DB_CHAIN_WORK_TIP, pBestInBatch->nChainWork);
+        batch.Write(DB_CHAIN_WORK_TIP, ArithToUint256(pBestInBatch->nChainWork));
     }
 
     return WriteBatch(batch, true);
