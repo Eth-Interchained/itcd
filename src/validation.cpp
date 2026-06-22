@@ -4383,6 +4383,8 @@ bool BlockManager::LoadBlockIndex(
 // Warm-boot on-demand ancestor loader (declared in chain.h)
 // ─────────────────────────────────────────────────────────────────────────────
 
+static std::atomic<uint64_t> g_warm_boot_demand_loads{0};
+
 bool WarmBootLoadParent(CBlockIndex* pindex)
 {
     // Called from GetAncestor under cs_main — do not re-lock.
@@ -4424,6 +4426,11 @@ bool WarmBootLoadParent(CBlockIndex* pindex)
         parent->nChainWork     = (parent->pprev ? parent->pprev->nChainWork : 0)
                                  + GetBlockProof(*parent);
         // parent->pprev loaded on demand if GetAncestor walks further.
+
+        uint64_t n = ++g_warm_boot_demand_loads;
+        if (n == 1 || n % 500 == 0)
+            LogPrintf("WarmBoot: demand-loaded %llu ancestor(s) from NEDB (latest height %d)\n",
+                      (unsigned long long)n, parent->nHeight);
     }
 
     pindex->pprev = parent;
