@@ -4615,7 +4615,16 @@ bool CChainState::LoadChainTip(const CChainParams& chainparams)
     // Load pointer to end of best chain
     CBlockIndex* pindex = LookupBlockIndex(coins_cache.GetBestBlock());
     if (!pindex) {
-        return false;
+        // Warm boot only loaded 2016 headers — the chainstate's persisted tip is
+        // outside the loaded window.  Fall back to genesis so the chain starts
+        // from a known-good anchor; IBD will resync the chainstate from there.
+        if (g_warm_boot_active) {
+            pindex = LookupBlockIndex(chainparams.GetConsensus().hashGenesisBlock);
+            if (!pindex) return false;
+            LogPrintf("LoadChainTip: warm boot — chainstate tip outside window, anchoring to genesis for IBD resync.\n");
+        } else {
+            return false;
+        }
     }
     m_chain.SetTip(pindex);
     PruneBlockIndexCandidates();

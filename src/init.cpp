@@ -1735,10 +1735,16 @@ bool AppInitMain(const util::Ref& context, NodeContext& node, interfaces::BlockA
             // Can't hold cs_main while calling RewindBlockIndex, so retrieve the relevant
             // chainstates beforehand.
             for (CChainState* chainstate : WITH_LOCK(::cs_main, return chainman.GetAll())) {
-                if (!fReset) {
+                if (!fReset && !g_warm_boot_active) {
                     // Note that RewindBlockIndex MUST run even if we're about to -reindex-chainstate.
                     // It both disconnects blocks based on the chainstate, and drops block data in
                     // BlockIndex() based on lack of available witness data.
+                    //
+                    // Skip during warm boot: only 2016 headers are loaded so
+                    // PruneBlockIndexCandidates inside RewindBlockIndex would
+                    // assert on the partial block index.  Soft-fork rewind is
+                    // not needed — blocks re-arrive via IBD and are re-validated
+                    // through the normal ConnectBlock path.
                     uiInterface.InitMessage(_("Rewinding blocks...").translated);
                     if (!chainstate->RewindBlockIndex(chainparams)) {
                         strLoadError = _(
