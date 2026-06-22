@@ -4390,13 +4390,21 @@ bool WarmBootLoadParent(CBlockIndex* pindex)
     // Called from GetAncestor under cs_main — do not re-lock.
     AssertLockHeld(cs_main);
 
-    if (!g_warm_boot_active || !pblocktree || !pindex || !pindex->phashBlock)
-        return false;
+    if (!g_warm_boot_active) { LogPrintf("WarmBootLoadParent: warm boot not active\n"); return false; }
+    if (!pblocktree)          { LogPrintf("WarmBootLoadParent: pblocktree is null\n");  return false; }
+    if (!pindex)              { LogPrintf("WarmBootLoadParent: pindex is null\n");       return false; }
+    if (!pindex->phashBlock)  { LogPrintf("WarmBootLoadParent: phashBlock is null\n");  return false; }
 
     // Read this block's stored entry to get its parent hash.
     CDiskBlockIndex di;
-    if (!pblocktree->ReadBlockIndex(*pindex->phashBlock, di) || di.hashPrev.IsNull())
+    if (!pblocktree->ReadBlockIndex(*pindex->phashBlock, di)) {
+        LogPrintf("WarmBootLoadParent: ReadBlockIndex failed for %s\n", pindex->phashBlock->GetHex().substr(0,16));
         return false;
+    }
+    if (di.hashPrev.IsNull()) {
+        LogPrintf("WarmBootLoadParent: hashPrev is null (genesis?), height=%d\n", pindex->nHeight);
+        return false;
+    }
 
     // Find or create the parent CBlockIndex.
     BlockMap& idx = g_chainman.BlockIndex();
