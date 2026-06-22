@@ -1794,6 +1794,35 @@ void PeerManager::ProcessHeadersMessage(CNode& pfrom, const std::vector<CBlockHe
         return;
     }
 
+    // ── Warm-boot seam check ─────────────────────────────────────────────────
+    // The warm-boot loaded 2016 blocks downward from our stored tip.  The first
+    // HEADERS message from any peer should continue upward from that same tip
+    // (hashPrevBlock of headers[0] == g_warm_boot_tip_hash).  This single hash
+    // comparison closes the 4032-block window: 2016 local + 2016 from the peer.
+    //
+    // Only run once (g_warm_boot_verified flips to true and stays there).
+    // Only relevant when g_warm_boot_active — ignored on normal full-scan boots.
+    if (g_warm_boot_active.load() && !g_warm_boot_verified.load() &&
+        !g_warm_boot_tip_hash.IsNull())
+    {
+        if (headers[0].hashPrevBlock == g_warm_boot_tip_hash) {
+            g_warm_boot_verified.store(true);
+            LogPrintf("WarmBoot: peer=%d seam VERIFIED — network tip continues from our stored tip %s\n",
+                      pfrom.GetId(),
+                      g_warm_boot_tip_hash.GetHex().substr(0, 16));
+        } else {
+            // Peer's chain does not connect to our warm-boot tip — wrong fork or
+            // deep reorg.  Cancel warm boot so the node falls back to a fresh
+            // full scan on the next restart.
+            LogPrintf("WarmBoot: peer=%d seam MISMATCH — expected %s got prev %s — warm boot cancelled\n",
+                      pfrom.GetId(),
+                      g_warm_boot_tip_hash.GetHex().substr(0, 16),
+                      headers[0].hashPrevBlock.GetHex().substr(0, 16));
+            g_warm_boot_active.store(false);
+        }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     bool received_new_header = false;
     const CBlockIndex *pindexLast = nullptr;
     {

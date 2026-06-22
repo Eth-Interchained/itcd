@@ -117,6 +117,19 @@ extern std::condition_variable g_best_block_cv;
 extern uint256 g_best_block;
 extern std::atomic_bool fImporting;
 extern std::atomic_bool fReindex;
+/** Warm-boot peer-comparison state.
+ *
+ * g_warm_boot_tip_hash   — hash of the tip we warm-booted from (written once by
+ *                          TryWarmBoot before any network threads start; safe to
+ *                          read without a lock from net_processing).
+ * g_warm_boot_verified   — set to true by ProcessHeadersMessage the moment a peer
+ *                          sends headers whose hashPrevBlock == g_warm_boot_tip_hash,
+ *                          confirming that the live network continues from our
+ *                          locally-stored tip (the 2016-block seam check).
+ */
+extern uint256           g_warm_boot_tip_hash;
+extern std::atomic<bool> g_warm_boot_verified;
+extern std::atomic<bool> g_warm_boot_active;
 /** Whether there are dedicated script-checking threads running.
  * False indicates all script checking is done on the main threadMessageHandler thread.
  */

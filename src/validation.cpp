@@ -141,6 +141,8 @@ uint256 g_best_block;
 bool g_parallel_script_checks{false};
 std::atomic_bool fImporting(false);
 std::atomic_bool fReindex(false);
+uint256           g_warm_boot_tip_hash;        // written once by TryWarmBoot, read by net_processing
+std::atomic<bool> g_warm_boot_verified{false}; // set when peer seam-check passes
 bool fHavePruned = false;
 bool fPruneMode = false;
 bool fRequireStandard = true;
@@ -4482,8 +4484,13 @@ bool CChainState::TryWarmBoot(CBlockTreeDB& blocktree,
     setBlockIndexCandidates.insert(ptip);
     pindexBestHeader = ptip;
 
-    LogPrintf("TryWarmBoot: loaded %u headers. Tip height %d. Startup in seconds.\n",
-              (unsigned)m_blockman.m_block_index.size(), ptip->nHeight);
+    // Record the tip hash so ProcessHeadersMessage can verify the seam when the
+    // first peer sends headers that should continue from exactly this block.
+    g_warm_boot_tip_hash = tip_hash;
+
+    LogPrintf("TryWarmBoot: loaded %u headers. Tip height %d chainwork %s. Awaiting peer seam-check.\n",
+              (unsigned)m_blockman.m_block_index.size(), ptip->nHeight,
+              tip_chainwork.GetHex().substr(0, 16));
     return true;
 }
 
