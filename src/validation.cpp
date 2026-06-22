@@ -4406,7 +4406,7 @@ bool WarmBootLoadParent(CBlockIndex* pindex)
         if (it != idx.end()) {
             parent = it->second;
         } else {
-            parent = ::ChainstateActive().m_blockman.InsertBlockIndex(di.hashPrev);
+            parent = g_chainman.m_blockman.InsertBlockIndex(di.hashPrev);
         }
     }
     if (!parent) return false;
