@@ -243,48 +243,54 @@ bool CBlockTreeDB::ReadTipHash(uint256& hash) {
 
 bool CBlockTreeDB::LoadBlockIndexFromTip(
     const uint256& tip_hash,
-    int depth,
     std::function<CBlockIndex*(const uint256&)> insertBlockIndex)
 {
-    // Warm-boot path: walk backwards from the stored tip loading only `depth`
-    // block headers.  Each lookup is a single direct NEDB get — O(depth) reads
-    // instead of O(N) where N is the full chain length.
+    // Warm-boot path: walk backwards from the stored tip all the way to genesis.
+    // Each step is a single direct NEDB key lookup — O(chain_height) reads
+    // instead of O(N) directory walk.  Loading the complete ancestry guarantees
+    // GetAncestor never walks past a nullptr pprev boundary.
     uint256 hash = tip_hash;
     int loaded   = 0;
 
-    while (!hash.IsNull() && loaded < depth) {
+    while (!hash.IsNull()) {
         if (ShutdownRequested()) return false;
 
         std::pair<char, uint256> key = {DB_BLOCK_INDEX, hash};
         CDiskBlockIndex diskindex;
         if (!Read(key, diskindex)) {
-            LogPrintf("LoadBlockIndexFromTip: missing entry at %s after %d blocks — falling back to full scan\n",
-                      hash.GetHex().substr(0, 8), loaded);
-            return false;   // caller will fall back to full nedb_scan
+            if (loaded == 0) {
+                LogPrintf("LoadBlockIndexFromTip: tip entry missing — falling back to full scan\n");
+                return false;
+            }
+            // Reached below the locally stored range (pruned or genesis gap) — stop here.
+            LogPrintf("LoadBlockIndex: warm boot reached storage boundary after %d headers.\n", loaded);
+            break;
         }
 
-        CBlockIndex* pindexNew  = insertBlockIndex(diskindex.GetBlockHash());
-        pindexNew->pprev        = insertBlockIndex(diskindex.hashPrev);
-        pindexNew->nHeight      = diskindex.nHeight;
-        pindexNew->nFile        = diskindex.nFile;
-        pindexNew->nDataPos     = diskindex.nDataPos;
-        pindexNew->nUndoPos     = diskindex.nUndoPos;
-        pindexNew->nVersion     = diskindex.nVersion;
+        CBlockIndex* pindexNew    = insertBlockIndex(diskindex.GetBlockHash());
+        // Only set pprev stub if hashPrev is non-null (genesis has hashPrev=0).
+        if (!diskindex.hashPrev.IsNull())
+            pindexNew->pprev      = insertBlockIndex(diskindex.hashPrev);
+        pindexNew->nHeight        = diskindex.nHeight;
+        pindexNew->nFile          = diskindex.nFile;
+        pindexNew->nDataPos       = diskindex.nDataPos;
+        pindexNew->nUndoPos       = diskindex.nUndoPos;
+        pindexNew->nVersion       = diskindex.nVersion;
         pindexNew->hashMerkleRoot = diskindex.hashMerkleRoot;
-        pindexNew->nTime        = diskindex.nTime;
-        pindexNew->nBits        = diskindex.nBits;
-        pindexNew->nNonce       = diskindex.nNonce;
-        pindexNew->nStatus      = diskindex.nStatus;
-        pindexNew->nTx          = diskindex.nTx;
+        pindexNew->nTime          = diskindex.nTime;
+        pindexNew->nBits          = diskindex.nBits;
+        pindexNew->nNonce         = diskindex.nNonce;
+        pindexNew->nStatus        = diskindex.nStatus;
+        pindexNew->nTx            = diskindex.nTx;
 
         hash = diskindex.hashPrev;
         loaded++;
 
         if (loaded % 500 == 0)
-            LogPrintf("LoadBlockIndex: warm boot %d / %d\n", loaded, depth);
+            LogPrintf("LoadBlockIndex: warm boot %d headers loaded...\n", loaded);
     }
 
-    LogPrintf("LoadBlockIndex: warm boot loaded %d headers from tip.\n", loaded);
+    LogPrintf("LoadBlockIndex: warm boot loaded %d headers from tip to genesis.\n", loaded);
     return loaded > 0;
 }
 

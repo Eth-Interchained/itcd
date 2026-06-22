@@ -4407,7 +4407,7 @@ bool CChainState::TryWarmBoot(CBlockTreeDB& blocktree,
     auto insertFn = [this](const uint256& h) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
         return this->m_blockman.InsertBlockIndex(h);
     };
-    if (!blocktree.LoadBlockIndexFromTip(tip_hash, 2016, insertFn)) {
+    if (!blocktree.LoadBlockIndexFromTip(tip_hash, insertFn)) {
         LogPrintf("TryWarmBoot: LoadBlockIndexFromTip failed — full scan required.\n");
         m_blockman.m_block_index.clear();
         return false;

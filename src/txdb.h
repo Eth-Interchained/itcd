@@ -111,7 +111,7 @@ public:
     bool ReadTipChainWork(arith_uint256& chainwork);
     bool WriteTipHash(const uint256& hash);
     bool ReadTipHash(uint256& hash);
-    bool LoadBlockIndexFromTip(const uint256& tip_hash, int depth,
+    bool LoadBlockIndexFromTip(const uint256& tip_hash,
                                std::function<CBlockIndex*(const uint256&)> insertBlockIndex);
     bool ReadBlockIndex(const uint256& hash, CDiskBlockIndex& diskindex);
 };
