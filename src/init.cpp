@@ -701,6 +701,10 @@ static void StartupNotify(const ArgsManager& args)
 }
 #endif
 
+// Set to true by AppInitMain when TryWarmBoot succeeds.
+// Cleared by ThreadImport after skipping the startup ActivateBestChain scan.
+static std::atomic<bool> g_warm_boot_active{false};
+
 static void ThreadImport(ChainstateManager& chainman, std::vector<fs::path> vImportFiles, const ArgsManager& args)
 {
     const CChainParams& chainparams = Params();

@@ -622,6 +622,15 @@ public:
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     /**
+     * Phase 2 warm-boot: load the last 2016 block headers from the persisted
+     * NEDB tip instead of scanning the full block index.  Returns true and
+     * seeds chain state on success; returns false and leaves state untouched
+     * so the caller falls back to LoadBlockIndex.
+     */
+    bool TryWarmBoot(CBlockTreeDB& blocktree, const Consensus::Params& params)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
+    /**
      * Update the on-disk chain state.
      * The caches and indexes are flushed depending on the mode we're called with
      * if they're too large, if it's been a while since the last write,
