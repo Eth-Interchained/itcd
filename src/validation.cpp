@@ -4484,6 +4484,39 @@ bool CChainState::TryWarmBoot(CBlockTreeDB& blocktree,
     setBlockIndexCandidates.insert(ptip);
     pindexBestHeader = ptip;
 
+    // ── Load genesis so the post-load genesis check in init.cpp passes ───────
+    // The check requires hashGenesisBlock to exist in m_block_index.  We only
+    // loaded the last 2016 headers, so genesis isn't there yet.  One direct
+    // NEDB lookup fetches it from the real store — no stubs, real data.
+    {
+        const uint256& genesis_hash = params.hashGenesisBlock;
+        if (m_blockman.m_block_index.find(genesis_hash) == m_blockman.m_block_index.end()) {
+            CDiskBlockIndex gd;
+            if (blocktree.ReadBlockIndex(genesis_hash, gd)) {
+                CBlockIndex* pg       = m_blockman.InsertBlockIndex(genesis_hash);
+                pg->pprev             = nullptr;
+                pg->nHeight           = gd.nHeight;
+                pg->nFile             = gd.nFile;
+                pg->nDataPos          = gd.nDataPos;
+                pg->nUndoPos          = gd.nUndoPos;
+                pg->nVersion          = gd.nVersion;
+                pg->hashMerkleRoot    = gd.hashMerkleRoot;
+                pg->nTime             = gd.nTime;
+                pg->nBits             = gd.nBits;
+                pg->nNonce            = gd.nNonce;
+                pg->nStatus           = gd.nStatus;
+                pg->nTx               = gd.nTx;
+                pg->nChainWork        = GetBlockProof(*pg);
+                pg->nChainTx          = gd.nTx;
+                LogPrintf("TryWarmBoot: loaded genesis block (height %d) from NEDB.\n", pg->nHeight);
+            } else {
+                LogPrintf("TryWarmBoot: genesis not in NEDB yet — first run, falling back to full scan.\n");
+                m_blockman.m_block_index.clear();
+                return false;
+            }
+        }
+    }
+
     // Record the tip hash so ProcessHeadersMessage can verify the seam when the
     // first peer sends headers that should continue from exactly this block.
     g_warm_boot_tip_hash = tip_hash;
