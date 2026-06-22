@@ -719,6 +719,7 @@ static void FindNextBlocksToDownload(NodeId nodeid, unsigned int count, std::vec
         int nToFetch = std::min(nMaxHeight - pindexWalk->nHeight, std::max<int>(count - vBlocks.size(), 128));
         vToFetch.resize(nToFetch);
         pindexWalk = state->pindexBestKnownBlock->GetAncestor(pindexWalk->nHeight + nToFetch);
+        if (!pindexWalk) return; // peer's chain ancestry not yet available (warm boot / IBD gap)
         vToFetch[nToFetch - 1] = pindexWalk;
         for (unsigned int i = nToFetch - 1; i > 0; i--) {
             vToFetch[i - 1] = vToFetch[i]->pprev;
