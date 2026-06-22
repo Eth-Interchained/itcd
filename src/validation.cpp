@@ -4425,7 +4425,7 @@ bool CChainState::TryWarmBoot(CBlockTreeDB& blocktree,
     auto insertFn = [this](const uint256& h) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
         return this->m_blockman.InsertBlockIndex(h);
     };
-    if (!m_blockman.GetBlockTreeDB().LoadBlockIndexFromTip(tip_hash, 2016, insertFn)) {
+    if (!blocktree.LoadBlockIndexFromTip(tip_hash, 2016, insertFn)) {
         LogPrintf("TryWarmBoot: LoadBlockIndexFromTip failed — full scan required.\n");
         m_blockman.m_block_index.clear();
         return false;
@@ -4463,7 +4463,8 @@ bool CChainState::TryWarmBoot(CBlockTreeDB& blocktree,
     // ── Anchor chain work to the persisted real cumulative value ─────────────
     // The loop above computed chainwork from the warm-boot boundary (≈0) not
     // from genesis. Add the offset so every block has its correct absolute work.
-    CBlockIndex* ptip = m_blockman.LookupBlockIndex(tip_hash);
+    auto tip_it = m_blockman.m_block_index.find(tip_hash);
+    CBlockIndex* ptip = (tip_it != m_blockman.m_block_index.end()) ? tip_it->second : nullptr;
     if (!ptip) {
         m_blockman.m_block_index.clear();
         return false;
