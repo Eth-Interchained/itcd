@@ -518,6 +518,18 @@ public:
  * Currently implemented: from the per-tx utxo model (0.8..0.14.x) to per-txout.
  */
 bool CCoinsViewDB::Upgrade() {
+    // NEDB-backed itcd never stores the pre-0.15 LevelDB per-tx UTXO format
+    // (DB_COINS 'c'): coins are written directly as per-txout CoinEntry (DB_COIN
+    // 'C') in CCoinsViewDB::BatchWrite, so there is nothing to migrate. Skipping
+    // matters for startup time — m_db->NewIterator() on the NEDB backend
+    // materializes the ENTIRE chainstate (nedb-ffi nedb_iter_new -> db.list +
+    // hex-decode every coin + sort), turning this legacy probe into an
+    // O(chainstate) startup stall for a migration that can never apply.
+    // Short-circuit it. The legacy LevelDB migration below is retained for a
+    // hypothetical LevelDB build but is unreachable on the NEDB backend.
+    LogPrintf("Chainstate init: skipping legacy LevelDB UTXO upgrade check (NEDB backend; nothing to migrate).\n");
+    return true;
+
     std::unique_ptr<CDBIterator> pcursor(m_db->NewIterator());
     pcursor->Seek(std::make_pair(DB_COINS, uint256()));
     if (!pcursor->Valid()) {
