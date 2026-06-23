@@ -551,12 +551,22 @@ pub extern "C" fn nedb_scan(
         // Progress fires immediately per entry: real-time counter on all storage types.
         let index_root = h.path.join("indexes").join(&h.coll).join("id");
         // Count entries first (directory stat, no file reads) for progress denominator.
+        // This can still take visible time on huge object stores, so emit
+        // progress callbacks with total=0 during discovery. The C++ callback treats
+        // these as status-only heartbeats and does not deserialize key/value bytes.
         let mut total: u64 = 0;
         if let Ok(shards) = fs::read_dir(&index_root) {
             for shard in shards.flatten() {
                 if shard.path().is_dir() {
                     if let Ok(files) = fs::read_dir(shard.path()) {
-                        total += files.count() as u64;
+                        for _ in files {
+                            total += 1;
+                            if total == 1 || total % 10_000 == 0 {
+                                unsafe {
+                                    callback(std::ptr::null(), 0, std::ptr::null(), 0, total, 0, ctx);
+                                }
+                            }
+                        }
                     }
                 }
             }
