@@ -34,6 +34,7 @@ use {
     serde_json::json,
     std::path::Path,
     std::sync::Arc,
+    std::sync::atomic::{AtomicBool, Ordering},
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -69,9 +70,11 @@ pub struct NedbHandle { inner: Mutex<NedbInner> }
 
 #[cfg(feature = "phase2")]
 pub struct NedbHandle {
-    db:   Arc<Db>,
-    coll: String,
-    path: std::path::PathBuf,  // database root directory for direct file access
+    db:     Arc<Db>,
+    coll:   String,
+    path:   std::path::PathBuf,                   // database root directory for direct file access
+    stop:   Arc<AtomicBool>,                      // signals the flush ticker to exit
+    ticker: Option<std::thread::JoinHandle<()>>,  // FFI-managed flush thread, joined on close
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -135,27 +138,60 @@ pub extern "C" fn nedb_open(path: *const c_char, _dek: *const c_char) -> *mut Ne
         };
         let db_arc = Arc::new(db);
         Db::start_cold_scan(Arc::clone(&db_arc));
-        // Flush MANIFEST every 5s so metadata is durable during long sessions.
-        // Block-level WAL durability is handled in nedb_batch_write (flush_all).
-        Db::start_manifest_ticker(Arc::clone(&db_arc), 5_000);
-        Box::into_raw(Box::new(NedbHandle { db: db_arc, coll, path: db_path.to_path_buf() }))
+
+        // FFI-managed, STOPPABLE flush ticker (replaces Db::start_manifest_ticker).
+        // The engine's built-in ticker is an infinite `loop {}` with no stop
+        // signal that holds its own Arc<Db>. With one per open database it kept
+        // flushing MANIFEST during shutdown and raced the final flush + Db
+        // teardown — segfaulting the node on Ctrl+C. nedb_close() now signals
+        // `stop` and JOINS this thread before the final flush, so no background
+        // thread can ever touch the Db during teardown. Poll every 100ms (clean,
+        // prompt shutdown); flush the WAL + MANIFEST every ~5s as before.
+        let stop   = Arc::new(AtomicBool::new(false));
+        let stop_t = Arc::clone(&stop);
+        let db_t   = Arc::clone(&db_arc);
+        let ticker = std::thread::spawn(move || {
+            let mut elapsed_ms: u64 = 0;
+            while !stop_t.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                elapsed_ms += 100;
+                if elapsed_ms >= 5_000 {
+                    elapsed_ms = 0;
+                    db_t.flush_all();
+                }
+            }
+        });
+
+        Box::into_raw(Box::new(NedbHandle {
+            db: db_arc, coll, path: db_path.to_path_buf(),
+            stop, ticker: Some(ticker),
+        }))
     }
 }
 
 #[no_mangle]
 pub extern "C" fn nedb_close(handle: *mut NedbHandle) {
     if handle.is_null() { return; }
+
+    // Take ownership so background work can be stopped before the Db is dropped.
+    #[allow(unused_mut)]
+    let mut boxed = unsafe { Box::from_raw(handle) };
+
     #[cfg(feature = "phase2")]
     {
-        // Flush the id-index WAL and MANIFEST before dropping.
-        // IdIndex::set() is WAL-only (zero disk I/O on hot path); a background
-        // ticker flushes it every 1s. Without explicit flush here, the WAL
-        // DashMap is dropped with the Db and unflushed writes are lost —
-        // breaking data persistence across close/reopen.
-        let h = unsafe { &*handle };
-        h.db.flush_all();
+        // Shutdown-safety invariant: no background thread may touch the Db while
+        // we flush and drop it. Stop the flush ticker and JOIN it first (polling
+        // is 100ms, so the join returns promptly), THEN do one final flush of the
+        // id-index WAL + MANIFEST. Without this the immortal ticker raced the
+        // teardown and segfaulted the node on Ctrl+C.
+        boxed.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = boxed.ticker.take() {
+            let _ = t.join();
+        }
+        boxed.db.flush_all();
     }
-    unsafe { drop(Box::from_raw(handle)) }
+
+    drop(boxed);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
