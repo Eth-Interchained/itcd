@@ -388,3 +388,43 @@ The current CI fix is proven. A future cleanup PR can move more of the link beha
 - portable glibc packaging still passes.
 
 Do not attempt that cleanup in the same PR as unrelated behavior changes.
+
+## Fast IBD — overclock + the real `fWipe` (read before touching sync speed or reindex)
+
+### Why headers fly but blocks crawl
+Header sync is bulk: one `getheaders` returns up to `MAX_HEADERS_RESULTS` (2000)
+headers per message. Block download is **per-block** and capped at
+`MAX_BLOCKS_IN_TRANSIT_PER_PEER` blocks in flight per peer. Stock Bitcoin sets
+that to **16**, so with a single fast peer you pull 16 blocks at a time while
+headers stream 2000 at a time — that is the entire reason a node can show
+"158k headers / 2k blocks".
+
+### What we changed (`src/net_processing.cpp`)
+- `MAX_BLOCKS_IN_TRANSIT_PER_PEER` 16 → **512** — deep pipelining; blocks fetch
+  in bulk and saturate a fast peer.
+- `BLOCK_DOWNLOAD_WINDOW` 1024 → **16384** — lets the in-flight set run far ahead
+  of the connected tip. NEDB's content-addressed store tolerates out-of-order
+  arrival, so the old LevelDB "disordering on disk" concern is moot.
+
+This is a **transport** overclock only. Every block is still fully validated
+(PoW, scripts per `assumevalid`, UTXO). No consensus rule, no security property
+is weakened. Blocks persist to disk on arrival, so a large in-flight set is
+request-tracking, not full blocks held in RAM. If a future mature chain has very
+large blocks and memory/bandwidth pressure appears, make these `-args`-tunable
+rather than reverting to 16.
+
+### `fWipe` is now real (`src/dbwrapper_nedb.cpp`)
+The NEDB `CDBWrapper` `fWipe` branch used to only **log** "wiping data
+directory" and do nothing. So `-reindex` / `-reindex-chainstate` / `fReset` left
+the NEDB store intact (sequences + MANIFEST survived), leaving a stale
+`view.GetBestBlock()` that tripped `assert(hashPrevBlock == view.GetBestBlock())`
+in `ConnectBlock()` on the genesis reconnect. It now `fs::remove_all(path)`
+before `nedb_open()` recreates the tree. Do not turn this back into a logging
+no-op; reindex correctness depends on it.
+
+### Known-open follow-up
+Warm boot onto a node that has **headers but no block data + an empty
+chainstate** can still stall block download (the `blocks=0` case). A clean sync
+and (now) `-reindex` both work; the resume-from-partial path needs the
+download-start logic to treat warm-booted headers as "need data". Track this
+before declaring warm-boot resume production-ready.

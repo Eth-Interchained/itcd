@@ -64,8 +64,21 @@ CDBWrapper::CDBWrapper(const fs::path& path, size_t nCacheSize,
 
     if (fWipe) {
         LogPrintf("NEDB: wiping data directory %s\n", m_name);
-        // Phase 2: call nedb_wipe(path) or remove the data directory.
-        // Phase 1: nothing to wipe — in-memory BTreeMap starts empty.
+        // Actually clear the on-disk NEDB store. Previously this was a no-op
+        // (it only logged), so -reindex / -reindex-chainstate / fReset left the
+        // stored sequences + MANIFEST intact. That stale state surfaced as a
+        // non-null view.GetBestBlock() on a "fresh" chainstate, tripping
+        //   assert(hashPrevBlock == view.GetBestBlock())
+        // in ConnectBlock() the moment the genesis block was reconnected.
+        // Remove the directory tree here; nedb_open() recreates the structure
+        // immediately below, giving a genuinely empty store.
+        try {
+            if (fs::exists(path)) {
+                fs::remove_all(path);
+            }
+        } catch (const std::exception& e) {
+            LogPrintf("NEDB: WARNING — wipe of %s failed: %s\n", m_name, e.what());
+        }
     }
 
     // Obfuscation is a no-op for NEDB (encryption is at the engine level).

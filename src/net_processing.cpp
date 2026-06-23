@@ -91,8 +91,16 @@ static constexpr auto OVERLOADED_PEER_TX_DELAY = std::chrono::seconds{2};
 static constexpr std::chrono::microseconds GETDATA_TX_INTERVAL{std::chrono::seconds{60}};
 /** Limit to avoid sending big packets. Not used in processing incoming GETDATA for compatibility */
 static const unsigned int MAX_GETDATA_SZ = 1000;
-/** Number of blocks that can be requested at any given time from a single peer. */
-static const int MAX_BLOCKS_IN_TRANSIT_PER_PEER = 16;
+/** Number of blocks that can be requested at any given time from a single peer.
+ *  OVERCLOCKED for NEDB fast IBD: stock Bitcoin keeps only 16 blocks in flight,
+ *  so with a single fast peer block download trickles 16-at-a-time while headers
+ *  stream 2000-at-a-time — the asymmetry behind "158k headers but 2k blocks".
+ *  Raising this pipelines block fetch (bulk download in effect) and saturates a
+ *  fast peer's bandwidth. This changes ONLY transport parallelism — every block
+ *  is still fully validated (PoW, scripts per assumevalid, UTXO), so no security
+ *  or consensus property is weakened. Blocks persist to disk on arrival, so the
+ *  in-flight set is request-tracking, not full blocks held in RAM. */
+static const int MAX_BLOCKS_IN_TRANSIT_PER_PEER = 512;
 /** Timeout in seconds during which a peer must stall block download progress before being disconnected. */
 static const unsigned int BLOCK_STALLING_TIMEOUT = 2;
 /** Number of headers sent in one getheaders result. We rely on the assumption that if a peer sends
@@ -107,7 +115,12 @@ static const int MAX_BLOCKTXN_DEPTH = 10;
  *  Larger windows tolerate larger download speed differences between peer, but increase the potential
  *  degree of disordering of blocks on disk (which make reindexing and pruning harder). We'll probably
  *  want to make this a per-peer adaptive value at some point. */
-static const unsigned int BLOCK_DOWNLOAD_WINDOW = 1024;
+// OVERCLOCKED for NEDB fast IBD: widened 16x so deep block-fetch pipelining
+// (MAX_BLOCKS_IN_TRANSIT_PER_PEER) can run far ahead of the connected tip.
+// NEDB's content-addressed storage tolerates out-of-order arrival, so the
+// classic "disordering on disk" concern that motivated a small window does not
+// bite the DAG backend the way it bit LevelDB.
+static const unsigned int BLOCK_DOWNLOAD_WINDOW = 16384;
 /** Block download timeout base, expressed in millionths of the block interval (i.e. 10 min) */
 static const int64_t BLOCK_DOWNLOAD_TIMEOUT_BASE = 1000000;
 /** Additional block download timeout per parallel downloading peer (i.e. 5 min) */
