@@ -4391,7 +4391,11 @@ bool WarmBootLoadParent(CBlockIndex* pindex)
     // Called from GetAncestor under cs_main — do not re-lock.
     AssertLockHeld(cs_main);
 
-    if (!g_warm_boot_active) { LogPrintf("WarmBootLoadParent: warm boot not active\n"); return false; }
+    // Inactive is the NORMAL case during a full-scan rebuild: BuildSkip() ->
+    // GetAncestor() reaches an unlinked stub and probes the demand-loader. Return
+    // quietly — logging here floods the startup log (hundreds of lines) for no
+    // reason. Genuine warm-boot errors below still log.
+    if (!g_warm_boot_active) return false;
     if (!pblocktree)          { LogPrintf("WarmBootLoadParent: pblocktree is null\n");  return false; }
     if (!pindex)              { LogPrintf("WarmBootLoadParent: pindex is null\n");       return false; }
     if (!pindex->phashBlock)  { LogPrintf("WarmBootLoadParent: phashBlock is null\n");  return false; }
