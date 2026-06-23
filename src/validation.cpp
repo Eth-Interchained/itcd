@@ -5239,6 +5239,7 @@ void LoadExternalBlockFile(const CChainParams& chainparams, FILE* fileIn, FlatFi
     int64_t nStart = GetTimeMillis();
 
     int nLoaded = 0;
+    int64_t nLastProgressLog = nStart;
     try {
         // This takes over fileIn and calls fclose() on it in the CBufferedFile destructor
         CBufferedFile blkdat(fileIn, 2*MAX_BLOCK_SERIALIZED_SIZE, MAX_BLOCK_SERIALIZED_SIZE+8, SER_DISK, CLIENT_VERSION);
@@ -5295,6 +5296,14 @@ void LoadExternalBlockFile(const CChainParams& chainparams, FILE* fileIn, FlatFi
                       BlockValidationState state;
                       if (::ChainstateActive().AcceptBlock(pblock, state, chainparams, nullptr, true, dbp, nullptr)) {
                           nLoaded++;
+                          const int64_t now = GetTimeMillis();
+                          if (nLoaded == 1 || nLoaded % 1000 == 0 || now - nLastProgressLog >= 10000) {
+                              LogPrintf("Reindex progress: loaded %d block(s), latest %s, file position %u:%u, elapsed %dms\n",
+                                        nLoaded, hash.ToString().substr(0, 16),
+                                        dbp ? dbp->nFile : -1, dbp ? dbp->nPos : 0,
+                                        (int)(now - nStart));
+                              nLastProgressLog = now;
+                          }
                       }
                       if (state.IsError()) {
                           break;
@@ -5334,6 +5343,14 @@ void LoadExternalBlockFile(const CChainParams& chainparams, FILE* fileIn, FlatFi
                             if (::ChainstateActive().AcceptBlock(pblockrecursive, dummy, chainparams, nullptr, true, &it->second, nullptr))
                             {
                                 nLoaded++;
+                                const int64_t now = GetTimeMillis();
+                                if (nLoaded == 1 || nLoaded % 1000 == 0 || now - nLastProgressLog >= 10000) {
+                                    LogPrintf("Reindex progress: loaded %d block(s), latest %s, file position %u:%u, elapsed %dms\n",
+                                              nLoaded, pblockrecursive->GetHash().ToString().substr(0, 16),
+                                              it->second.nFile, it->second.nPos,
+                                              (int)(now - nStart));
+                                    nLastProgressLog = now;
+                                }
                                 queue.push_back(pblockrecursive->GetHash());
                             }
                         }

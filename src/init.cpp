@@ -1741,10 +1741,16 @@ bool AppInitMain(const util::Ref& context, NodeContext& node, interfaces::BlockA
                 bool failed_chainstate_init = false;
 
                 for (CChainState* chainstate : chainman.GetAll()) {
+                    const int64_t coinsdb_start_time = GetTimeMillis();
+                    const bool should_wipe_coinsdb = fReset || fReindexChainState;
+                    LogPrintf("Chainstate init: opening NEDB coins database%s...\n",
+                              should_wipe_coinsdb ? " (wipe requested)" : "");
                     chainstate->InitCoinsDB(
                         /* cache_size_bytes */ nCoinDBCache,
                         /* in_memory */ false,
-                        /* should_wipe */ fReset || fReindexChainState);
+                        /* should_wipe */ should_wipe_coinsdb);
+                    LogPrintf("Chainstate init: NEDB coins database opened in %dms\n",
+                              GetTimeMillis() - coinsdb_start_time);
 
                     chainstate->CoinsErrorCatcher().AddReadErrCallback([]() {
                         uiInterface.ThreadSafeMessageBox(
@@ -1754,34 +1760,51 @@ bool AppInitMain(const util::Ref& context, NodeContext& node, interfaces::BlockA
 
                     // If necessary, upgrade from older database format.
                     // This is a no-op if we cleared the coinsviewdb with -reindex or -reindex-chainstate
+                    const int64_t upgrade_start_time = GetTimeMillis();
+                    LogPrintf("Chainstate init: checking coins database upgrade path...\n");
                     if (!chainstate->CoinsDB().Upgrade()) {
                         strLoadError = _("Error upgrading chainstate database");
                         failed_chainstate_init = true;
                         break;
                     }
+                    LogPrintf("Chainstate init: coins database upgrade check completed in %dms\n",
+                              GetTimeMillis() - upgrade_start_time);
 
                     // ReplayBlocks is a no-op if we cleared the coinsviewdb with -reindex or -reindex-chainstate
+                    const int64_t replay_start_time = GetTimeMillis();
+                    LogPrintf("Chainstate init: replaying blocks if needed...\n");
                     if (!chainstate->ReplayBlocks(chainparams)) {
                         strLoadError = _("Unable to replay blocks. You will need to rebuild the database using -reindex-chainstate.");
                         failed_chainstate_init = true;
                         break;
                     }
+                    LogPrintf("Chainstate init: replay completed in %dms\n",
+                              GetTimeMillis() - replay_start_time);
 
                     // The on-disk coinsdb is now in a good state, create the cache
+                    const int64_t cache_start_time = GetTimeMillis();
+                    LogPrintf("Chainstate init: allocating coins cache...\n");
                     chainstate->InitCoinsCache(nCoinCacheUsage);
                     assert(chainstate->CanFlushToDisk());
+                    LogPrintf("Chainstate init: coins cache allocated in %dms\n",
+                              GetTimeMillis() - cache_start_time);
 
                     if (!is_coinsview_empty(chainstate)) {
                         // LoadChainTip initializes the chain based on CoinsTip()'s best block
+                        const int64_t tip_start_time = GetTimeMillis();
+                        LogPrintf("Chainstate init: loading active chain tip from coins database...\n");
                         if (!chainstate->LoadChainTip(chainparams)) {
                             strLoadError = _("Error initializing block database");
                             failed_chainstate_init = true;
                             break; // out of the per-chainstate loop
                         }
+                        LogPrintf("Chainstate init: active chain tip loaded in %dms\n",
+                                  GetTimeMillis() - tip_start_time);
                         assert(chainstate->m_chain.Tip() != nullptr);
+                    } else {
+                        LogPrintf("Chainstate init: coins view empty; skipping active tip load.\n");
                     }
                 }
-
                 if (failed_chainstate_init) {
                     break; // out of the chainstate activation do-while
                 }

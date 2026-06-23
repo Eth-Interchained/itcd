@@ -348,6 +348,7 @@ struct LoadIndexCtx {
     std::function<CBlockIndex*(const uint256&)>*      insertBlockIndex;
     bool                                              error_flag;
     std::string                                       error_msg;
+    int64_t                                           start_ms{0};
 };
 
 // nedb_scan callback — invoked once per stored block index entry.
@@ -364,15 +365,26 @@ static void LoadIndexCallback(
     if (ctx->error_flag) return;   // stop processing after first error
 
     // Log progress every 10 000 entries so the operator knows startup is alive.
-    if (progress == 1 || progress % 10000 == 0) {
-        if (total > 0)
-            LogPrintf("LoadBlockIndex: %llu / %llu (%.0f%%)\n",
-                      (unsigned long long)progress,
-                      (unsigned long long)total,
-                      100.0 * (double)progress / (double)total);
-        else
-            LogPrintf("LoadBlockIndex: %llu block headers...\n",
+    // nedb_scan also emits progress callbacks with total=0 while it is counting
+    // index files before the real scan starts; surface those too so startup never
+    // looks frozen on a large NEDB store.
+    if (total == 0) {
+        if (progress == 1 || progress % 10000 == 0) {
+            LogPrintf("LoadBlockIndex: discovering NEDB entries... %llu seen\n",
                       (unsigned long long)progress);
+        }
+        return;
+    }
+
+    if (progress == 1 || progress % 10000 == 0 || progress == total) {
+        const int64_t elapsed_ms = ctx->start_ms > 0 ? GetTimeMillis() - ctx->start_ms : 0;
+        const double rate = elapsed_ms > 0 ? (1000.0 * (double)progress / (double)elapsed_ms) : 0.0;
+        LogPrintf("LoadBlockIndex: %llu / %llu (%.0f%%, %.0f entries/s, %dms)\n",
+                  (unsigned long long)progress,
+                  (unsigned long long)total,
+                  100.0 * (double)progress / (double)total,
+                  rate,
+                  (int)elapsed_ms);
     }
 
     // Deserialise the key: (DB_BLOCK_INDEX prefix byte, uint256 block hash).
@@ -429,6 +441,7 @@ bool CBlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, 
     ctx.consensusParams  = &consensusParams;
     ctx.insertBlockIndex = &insertBlockIndex;
     ctx.error_flag       = false;
+    ctx.start_ms         = GetTimeMillis();
 
     if (ShutdownRequested()) return false;
 
