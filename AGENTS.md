@@ -428,3 +428,24 @@ chainstate** can still stall block download (the `blocks=0` case). A clean sync
 and (now) `-reindex` both work; the resume-from-partial path needs the
 download-start logic to treat warm-booted headers as "need data". Track this
 before declaring warm-boot resume production-ready.
+
+## Shutdown safety — the flush ticker MUST be stoppable (`nedb-ffi/src/lib.rs`)
+
+The node opens several NEDB databases (block index, chainstate, tokens). The
+engine's `Db::start_manifest_ticker` spawns an **infinite `loop {}`** flush thread
+with no stop signal that holds its own `Arc<Db>`. One per database kept flushing
+`MANIFEST` (tmp-write + rename) **during** shutdown, racing the final flush and
+the `Db` teardown → **segfault on Ctrl+C** (seen right after "Dumped mempool";
+the IBD overclock widened the shutdown-flush window and made it easier to hit).
+
+Fix: the FFI no longer calls `Db::start_manifest_ticker`. `nedb_open` spawns its
+own ticker that polls a `stop: Arc<AtomicBool>` every 100ms and flushes every
+~5s; `nedb_close` takes ownership of the handle, sets `stop`, **joins** the
+thread, then does the final `flush_all()` and drops. Invariant: **no background
+thread may touch the `Db` while it is being flushed/dropped.** Do not reintroduce
+an unstoppable/detached flush thread.
+
+Residual: `Db::start_cold_scan` is still an engine-spawned thread, but it is
+finite (scans once, then exits) and is skipped entirely on warm start, so it is
+not a recurring teardown hazard. Give it the same stop+join treatment if cold
+starts ever show shutdown races.
