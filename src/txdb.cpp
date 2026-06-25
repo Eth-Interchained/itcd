@@ -349,11 +349,13 @@ bool CBlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockF
     }
 
     bool ok = WriteBatch(batch, true);
-    // Diagnostics: how many per-entry provenance disk-reads this no-provenance
-    // block-index DB has avoided (the read-before-write that used to dominate
-    // the "write block index to disk" flush stage). Visible under -debug=bench.
-    LogPrint(BCLog::BENCH, "NEDB block index: %llu provenance reads sliced (cumulative)\n",
-             (unsigned long long)nedb_reads_sliced(GetHandle()));
+    // Diagnostics (visible under -debug=bench) for the no-provenance block-index
+    // DB: per-entry provenance disk-reads avoided (#53) and redundant byte-
+    // identical writes skipped by the dedup shadow map. Together these are what
+    // collapse the "write block index to disk" flush stage.
+    LogPrint(BCLog::BENCH, "NEDB block index: %llu provenance reads sliced, %llu redundant writes skipped (cumulative)\n",
+             (unsigned long long)nedb_reads_sliced(GetHandle()),
+             (unsigned long long)nedb_writes_skipped(GetHandle()));
     return ok;
 }
 

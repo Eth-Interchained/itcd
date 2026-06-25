@@ -32,8 +32,10 @@ use {
 use {
     nedb_engine::{Db, Dek},
     serde_json::json,
+    std::collections::HashMap,
     std::path::Path,
     std::sync::Arc,
+    std::sync::Mutex,
     std::sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
@@ -88,6 +90,18 @@ pub struct NedbHandle {
     // Diagnostics: number of provenance reads avoided (writes issued while
     // provenance was disabled). Surfaced via nedb_reads_sliced().
     reads_sliced: AtomicU64,
+    // Write-dedup shadow map (no-provenance DBs only): id → BLAKE2b of the last
+    // value we durably wrote for that id. A write whose value hashes identically
+    // is skipped — no object write, no id-index churn, no Merkle advance, and no
+    // disk read. SAFETY/consistency with the engine's id_index: an entry is set
+    // ONLY after put_batch/put succeeds, evicted on delete, and the map starts
+    // empty each process. So a skip can only happen when the engine provably
+    // already holds that exact value (we wrote it earlier this session), and the
+    // engine's current-value pointer is never left missing a real update. Bounded
+    // to lookup-table DBs (the block index) where redundant rewrites dominate;
+    // the chainstate (provenance on) never populates this and is unaffected.
+    write_cache:    Mutex<HashMap<String, [u8; 32]>>,
+    writes_skipped: AtomicU64,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -180,6 +194,8 @@ pub extern "C" fn nedb_open(path: *const c_char, _dek: *const c_char) -> *mut Ne
             stop, ticker: Some(ticker),
             provenance:   AtomicBool::new(true),  // on by default; opt-out per DB
             reads_sliced: AtomicU64::new(0),
+            write_cache:    Mutex::new(HashMap::new()),
+            writes_skipped: AtomicU64::new(0),
         }))
     }
 }
@@ -252,6 +268,36 @@ pub extern "C" fn nedb_reads_sliced(handle: *mut NedbHandle) -> u64 {
     {
         0
     }
+}
+
+/// Number of redundant writes skipped by the write-dedup shadow map (values
+/// rewritten with byte-identical content). Diagnostic only; 0 in Phase 1.
+#[no_mangle]
+pub extern "C" fn nedb_writes_skipped(handle: *mut NedbHandle) -> u64 {
+    if handle.is_null() { return 0; }
+    #[cfg(feature = "phase2")]
+    {
+        unsafe { &*handle }.writes_skipped.load(Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "phase2"))]
+    {
+        0
+    }
+}
+
+/// BLAKE2b-256 fingerprint of a value's bytes — the write-dedup key. Independent
+/// of the engine's per-Node content hash (which folds in seq/ts and so differs
+/// for identical values); this fingerprints the payload alone, so a re-written
+/// value matches its predecessor and can be skipped.
+#[cfg(feature = "phase2")]
+fn dedup_fingerprint(bytes: &[u8]) -> [u8; 32] {
+    use blake2::{Blake2b512, Digest};
+    let mut hasher = Blake2b512::new();
+    hasher.update(bytes);
+    let out = hasher.finalize();
+    let mut fp = [0u8; 32];
+    fp.copy_from_slice(&out[..32]);
+    fp
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -406,22 +452,39 @@ pub extern "C" fn nedb_put(
         let val_bytes = unsafe { std::slice::from_raw_parts(value, value_len) };
         let key_id  = hex::encode(key_bytes);
         let val_hex = hex::encode(val_bytes);
-        // Provenance read-before-write — skipped when this DB opted out (see
-        // nedb_set_provenance). The engine still derives `prev` from the in-memory
-        // id_index, so the version chain and get() are unaffected.
-        let caused_by = if h.provenance.load(Ordering::Relaxed) {
-            h.db.get(&h.coll, &key_id)
+        let provenance = h.provenance.load(Ordering::Relaxed);
+
+        if !provenance {
+            // No-provenance fast path (e.g. block index): skip the caused_by
+            // read entirely, and skip the write too if the value is byte-
+            // identical to what we last durably wrote for this key.
+            let fp = dedup_fingerprint(val_bytes);
+            if h.write_cache.lock().unwrap().get(&key_id) == Some(&fp) {
+                h.writes_skipped.fetch_add(1, Ordering::Relaxed);
+                return 0;
+            }
+            h.reads_sliced.fetch_add(1, Ordering::Relaxed);
+            let data = json!({ "v": val_hex });
+            match h.db.put(&h.coll, &key_id, data, Vec::new(), None, None) {
+                Ok(_)  => {
+                    // Commit the fingerprint only after the durable write.
+                    h.write_cache.lock().unwrap().insert(key_id, fp);
+                    0
+                }
+                Err(_) => -1,
+            }
+        } else {
+            // Provenance on (e.g. chainstate): derive caused_by from the prior
+            // version's content hash — unchanged behavior.
+            let caused_by = h.db.get(&h.coll, &key_id)
                 .filter(|n| !n.hash.is_empty())
                 .map(|n| vec![n.hash.clone()])
-                .unwrap_or_default()
-        } else {
-            h.reads_sliced.fetch_add(1, Ordering::Relaxed);
-            Vec::new()
-        };
-        let data = json!({ "v": val_hex });
-        match h.db.put(&h.coll, &key_id, data, caused_by, None, None) {
-            Ok(_)  => 0,
-            Err(_) => -1,
+                .unwrap_or_default();
+            let data = json!({ "v": val_hex });
+            match h.db.put(&h.coll, &key_id, data, caused_by, None, None) {
+                Ok(_)  => 0,
+                Err(_) => -1,
+            }
         }
     }
 }
@@ -443,6 +506,9 @@ pub extern "C" fn nedb_del(handle: *mut NedbHandle, key: *const c_uchar, key_len
     {
         let h      = unsafe { &*handle };
         let key_id = hex::encode(unsafe { std::slice::from_raw_parts(key, key_len) });
+        // Evict from the write-dedup shadow map: after a delete the engine no
+        // longer holds this value, so a later identical write must NOT be skipped.
+        h.write_cache.lock().unwrap().remove(&key_id);
         match h.db.delete(&h.coll, &key_id) { Ok(_) => 0, Err(_) => -1 }
     }
 }
@@ -545,30 +611,57 @@ pub extern "C" fn nedb_batch_write(handle: *mut NedbHandle, ops: *const NedbOp, 
                 None     => { idx.insert(kid.clone(), resolved.len()); resolved.push((kid, val)); }
             }
         }
+        let provenance = h.provenance.load(Ordering::Relaxed);
+        // No-provenance lookup-table DBs (the block index) also get write-dedup:
+        // a value re-written with byte-identical content is skipped entirely —
+        // no object write, no id-index churn, no Merkle advance, no disk read.
+        let dedup = !provenance;
+
         let mut puts_raw: Vec<(String, Vec<u8>)> = Vec::with_capacity(resolved.len());
         let mut del_ids:  Vec<String>            = Vec::new();
-        for (kid, val) in resolved {
-            match val {
-                Some(v) => puts_raw.push((kid, v)),
-                None    => del_ids.push(kid),
+        // Fingerprints to commit to the shadow map AFTER the batch is durably
+        // written (never before — see the write_cache safety note on NedbHandle).
+        let mut pending_fp: Vec<(String, [u8; 32])> = Vec::new();
+        let mut skipped: u64 = 0;
+
+        if dedup {
+            // cs_main is held by the caller, so there is no concurrent writer.
+            // Reads decide skips; deletes evict immediately (always safe — worst
+            // case a later write simply isn't deduped); put fingerprints are
+            // staged and committed only once the write is durable.
+            let mut cache = h.write_cache.lock().unwrap();
+            for (kid, val) in resolved {
+                match val {
+                    Some(v) => {
+                        let fp = dedup_fingerprint(&v);
+                        if cache.get(&kid) == Some(&fp) {
+                            skipped += 1; // identical bytes already stored → skip
+                        } else {
+                            pending_fp.push((kid.clone(), fp));
+                            puts_raw.push((kid, v));
+                        }
+                    }
+                    None => { cache.remove(&kid); del_ids.push(kid); }
+                }
+            }
+        } else {
+            for (kid, val) in resolved {
+                match val {
+                    Some(v) => puts_raw.push((kid, v)),
+                    None    => del_ids.push(kid),
+                }
             }
         }
 
-        // Build the put ops IN PARALLEL while preserving causal provenance:
-        // every write is caused_by the previous version's content hash for that
-        // key — the version chain TRACE walks and the integrity backbone of the
-        // NEDB-backed chain. The read-before-write that establishes provenance
-        // is what used to run serially (≈700 ops/s → 40s+ UTXO flushes); here it
-        // fans out across every core. Provenance is fully retained.
-        // Provenance read-before-write. For DBs that opted out via
-        // nedb_set_provenance (e.g. the block index, whose causal lineage is
-        // already in the payload via hashPrev), skip the per-entry db.get() —
-        // each one is a full content-addressed object load from disk (no read
-        // cache) solely to copy a hash into caused_by, and it dominates the
-        // block-index flush. The engine still sets node.prev from the in-memory
-        // id_index, so get()/latest-write-wins is unchanged; only the caused_by
-        // DAG edges are omitted for this (non-consensus) database.
-        let provenance = h.provenance.load(Ordering::Relaxed);
+        // Build the put ops IN PARALLEL. The provenance read-before-write (the
+        // per-entry db.get() that derives caused_by) is skipped for DBs that
+        // opted out via nedb_set_provenance — e.g. the block index, whose causal
+        // lineage is already in the payload via hashPrev. Each db.get() is a full
+        // content-addressed object load from disk (no read cache) solely to copy
+        // a hash into caused_by, and it dominated the block-index flush. The
+        // engine still sets node.prev from the in-memory id_index, so
+        // get()/latest-write-wins is unchanged; only the caused_by DAG edges are
+        // omitted for this (non-consensus) database.
         let put_ops: Vec<(String, String, serde_json::Value, Vec<String>, Option<String>, Option<String>)> =
             puts_raw.par_iter().map(|(kid, val)| {
                 let caused_by = if provenance {
@@ -602,6 +695,18 @@ pub extern "C" fn nedb_batch_write(handle: *mut NedbHandle, ops: *const NedbOp, 
 
         // One durability point per batch — flush id-index WAL + MANIFEST.
         db.flush_all();
+
+        // Commit dedup fingerprints only now that the writes are durable, so the
+        // shadow map can never claim a value the engine does not actually hold.
+        if dedup {
+            if !pending_fp.is_empty() {
+                let mut cache = h.write_cache.lock().unwrap();
+                for (kid, fp) in pending_fp { cache.insert(kid, fp); }
+            }
+            if skipped > 0 {
+                h.writes_skipped.fetch_add(skipped, Ordering::Relaxed);
+            }
+        }
         0
     }
 }
