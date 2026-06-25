@@ -81,6 +81,13 @@ void nedb_set_provenance(NedbHandle *handle, int enabled);
  */
 uint64_t nedb_reads_sliced(NedbHandle *handle);
 
+/**
+ * Number of redundant writes skipped by the write-dedup shadow map — values
+ * re-written with byte-identical content on a no-provenance DB. Diagnostic only.
+ * Returns 0 in Phase 1.
+ */
+uint64_t nedb_writes_skipped(NedbHandle *handle);
+
 /* ---- Single-record operations --------------------------------------- */
 
 /**
