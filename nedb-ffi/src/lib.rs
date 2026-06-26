@@ -225,6 +225,41 @@ pub extern "C" fn nedb_close(handle: *mut NedbHandle) {
     drop(boxed);
 }
 
+/// Enable (1) or disable (0) the NEDB v3 segment/pack object store for databases
+/// opened AFTER this call. **Must be called BEFORE nedb_open()** — the engine
+/// selects its object substrate when the store is constructed at open time
+/// (it reads the process-global `NEDB_DAG_V3` switch there). Process-global by
+/// design: the ITC node calls this once at startup (via the `-dagv3` arg) so the
+/// block index AND the chainstate both run on segments.
+///
+/// v3 batches the default one-file-per-object loose store into append-only
+/// segment packs — one fsync per group-commit instead of one per object — with
+/// background compaction and `.idx` sidecars, which is what makes the chainstate
+/// / block-index flush fast during IBD. It is TRANSPARENT to everything this FFI
+/// exposes: keys, values, get/put/batch, the BLAKE2b Merkle head, AS OF, and
+/// causal provenance are all unchanged. Existing v2 loose objects stay readable
+/// via the engine's dual-read fallback, so flipping this on is non-destructive.
+/// Default: off (v2 loose objects) — this is a pure opt-in.
+#[no_mangle]
+pub extern "C" fn nedb_set_dag_v3(enabled: c_int) {
+    #[cfg(feature = "phase2")]
+    {
+        // The ITC node calls this during single-threaded startup, before any
+        // nedb_open(), so the set is observed by the engine when it constructs
+        // the object store. (The engine re-reads the switch at every open, so it
+        // also covers the second DB opened in-process.)
+        if enabled != 0 {
+            std::env::set_var("NEDB_DAG_V3", "1");
+        } else {
+            std::env::remove_var("NEDB_DAG_V3");
+        }
+    }
+    #[cfg(not(feature = "phase2"))]
+    {
+        let _ = enabled; // Phase 1 (in-process map) has no on-disk substrate.
+    }
+}
+
 /// Enable (1) or disable (0) causal provenance for writes on this database.
 ///
 /// Default is enabled. Disable it ONLY for lookup-table databases whose causal
@@ -1209,5 +1244,39 @@ mod tests {
 
         nedb_close(h2);
         cleanup("t_persist");
+    }
+
+    // End-to-end check of the --dagv3 FFI wiring: nedb_set_dag_v3(1) must make a
+    // subsequently-opened DB use the v3 segment/pack substrate (the engine then
+    // creates objects/segments/). #[ignore]d because it mutates the process-
+    // global NEDB_DAG_V3 switch — if it ran in the default parallel suite a
+    // sibling test could open a DB inside the v3 window and then reopen it after
+    // the switch flips back, breaking its persistence assertion. Run it serially:
+    //   cargo test -p nedb-ffi -- --ignored --test-threads=1
+    // (v3's storage behavior itself is covered by the engine suite, nedb-engine v2.3.33.)
+    #[cfg(feature = "phase2")]
+    #[test]
+    #[ignore = "mutates process-global NEDB_DAG_V3; run with --ignored --test-threads=1"]
+    fn dagv3_switch_opens_segment_store() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("itcd_dagv3_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        nedb_set_dag_v3(1);
+        let cpath = CString::new(dir.to_string_lossy().as_ref()).unwrap();
+        let h = nedb_open(cpath.as_ptr(), std::ptr::null());
+        assert!(!h.is_null(), "open failed under --dagv3");
+
+        let k: &[u8] = b"utxo:0";
+        let v: &[u8] = b"coin";
+        let op = NedbOp { key: k.as_ptr(), key_len: k.len(), value: v.as_ptr(), value_len: v.len() };
+        assert_eq!(nedb_batch_write(h, &op, 1), 0, "batch write failed under v3");
+        nedb_close(h); // flush_all() -> segment fsync
+
+        assert!(dir.join("objects").join("segments").is_dir(),
+                "v3 must create objects/segments/ when NEDB_DAG_V3 is set before open");
+
+        nedb_set_dag_v3(0); // restore default so nothing else observes v3
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -102,6 +102,17 @@ CDBWrapper::CDBWrapper(const fs::path& path, size_t nCacheSize,
               m_name,
               fMemory ? " (in-memory)" : "");
 
+    // NEDB v3 opt-in (-dagv3): switch the object substrate to the segment/pack
+    // store for this (and every subsequently-opened) NEDB database. MUST run
+    // before nedb_open() — the engine picks its substrate at open time. v3 is
+    // transparent to the KV / Merkle head / AS OF / causal-provenance contract,
+    // and existing v2 loose objects stay readable via dual-read, so this is a
+    // non-destructive opt-in. Applies to both the block index and the chainstate.
+    if (gArgs.GetBoolArg("-dagv3", false)) {
+        nedb_set_dag_v3(1);
+        LogPrintf("NEDB: v3 segment/pack object store ENABLED for '%s' (-dagv3)\n", m_name);
+    }
+
     pdb = nedb_open(m_name.c_str(), dek);
     if (!pdb) {
         throw dbwrapper_error("NEDB: failed to open database: " + m_name);

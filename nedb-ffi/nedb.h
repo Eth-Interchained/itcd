@@ -60,6 +60,22 @@ NedbHandle *nedb_open(const char *path, const char *dek);
 void nedb_close(NedbHandle *handle);
 
 /**
+ * Enable (1) or disable (0) the NEDB v3 segment/pack object store for databases
+ * opened AFTER this call. Must be called BEFORE nedb_open(): the engine selects
+ * its object substrate at open time (it reads the process-global NEDB_DAG_V3
+ * switch there). Process-global by design — the node calls it once at startup
+ * (via -dagv3) so the block index and chainstate both run on segments.
+ *
+ * v3 batches the default one-file-per-object loose store into append-only
+ * segment packs (one fsync per group-commit instead of per object) with
+ * background compaction and .idx sidecars — this is what makes the chainstate /
+ * block-index flush fast during IBD. It is transparent to keys, values, the
+ * BLAKE2b Merkle head, AS OF, and causal provenance; existing v2 loose objects
+ * stay readable via dual-read. Default: off (v2 loose objects) — pure opt-in.
+ */
+void nedb_set_dag_v3(int enabled);
+
+/**
  * Enable (1) or disable (0) causal provenance for writes on @handle.
  *
  * Default: enabled. Disable ONLY for lookup-table databases whose causal lineage
