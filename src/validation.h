@@ -82,6 +82,20 @@ static const int64_t DEFAULT_BLOCK_FLUSH_WINDOW = 0;
  *  Proof-of-Prefix peer seam, and Core's own VerifyDB over the last blocks. Enable
  *  -verifynedb for an eager full-store re-hash (e.g. after suspected disk corruption). */
 static const bool DEFAULT_VERIFY_NEDB = false;
+/** NEDB warm boot (Proof-of-Prefix window resume) — OFF by default.
+ *
+ *  When OFF, startup performs the standard full block-index scan: one sequential
+ *  NEDB pass that links the entire index and builds real skip pointers, so
+ *  CBlockIndex::GetAncestor() is O(log n) and the on-demand ancestor loader is
+ *  never armed (g_warm_boot_active stays false).
+ *
+ *  When ON (-warmboot=1), only the last 2016 headers + genesis are loaded with
+ *  NO skip pointers; any deep GetAncestor (BuildSkip on new headers, GetLocator,
+ *  the LoadChainTip resume) then demand-loads ancestors one NEDB read at a time.
+ *  On an already-synced chain that degrades to a tip->genesis per-block crawl
+ *  (hours) and leaves a null-pprev crash surface. Kept behind this flag for
+ *  experiments only — see WarmBootLoadParent / TryWarmBoot in validation.cpp. */
+static const bool DEFAULT_WARM_BOOT = false;
 static const bool DEFAULT_CHECKPOINTS_ENABLED = true;
 static const bool DEFAULT_TXINDEX = false;
 static const char* const DEFAULT_BLOCKFILTERINDEX = "0";

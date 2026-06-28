@@ -420,6 +420,7 @@ void SetupServerArgs(NodeContext& node)
     argsman.AddArg("-flushwindow=<n>", strprintf("Force a full chainstate flush every <n> connected blocks during sync, bounding how much dirty UTXO a clean shutdown must write (and how much an unclean exit loses), at the cost of some write amplification. 0 = disabled, rely only on the cache-size/time triggers (default: %d).", DEFAULT_BLOCK_FLUSH_WINDOW), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-coinprefetch", strprintf("During initial block download, batch-read every input coin a block spends from NEDB in one parallel lookup before validating it, instead of faulting them in one-by-one. Pure read-side sync optimization — the connected chainstate is byte-identical (default: %u).", DEFAULT_COIN_PREFETCH), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-verifynedb", strprintf("Run an eager full-store NEDB integrity scan at startup (re-hashes every content-addressed object — O(n), can take minutes at scale). Off by default: integrity is enforced lazily by content-addressed read verification, the warm-boot window load, the Proof-of-Prefix peer seam, and the standard last-blocks VerifyDB. Enable after suspected on-disk corruption (default: %u).", DEFAULT_VERIFY_NEDB), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-warmboot", strprintf("Resume from the persisted NEDB tip by loading only the last 2016 block headers and demand-loading deeper ancestors lazily from the NEDB DAG (Proof-of-Prefix warm boot). OFF by default: a normal start does a single, bounded full block-index scan that links the whole index with skip pointers. Warm boot trades that one-time scan for a lazy ancestor loader that, on an already-synced chain, can crawl from tip to genesis one block at a time (hours) — the source of the startup demand-load stall — and leaves a null-pprev crash surface. Enable only for experiments (default: %u).", DEFAULT_WARM_BOOT), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-dagv3", "Use the NEDB v3 segment/pack object store instead of the default loose one-file-per-object store. Batches writes into append-only segment packs (one fsync per group-commit) with background compaction and .idx sidecars — much faster chainstate and block-index flush during sync, and far fewer inodes. Transparent to consensus data (keys, values, Merkle head, AS OF, causal provenance are unchanged); existing stores are read back via dual-read, so it is a non-destructive opt-in. Default: off.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-dagfastsync", "With -dagv3, use a plain fsync(2) at NEDB v3 segment durability points instead of the OS full barrier (F_FULLFSYNC on macOS). Much faster chainstate flush on macOS (Fusion/SATA) at the cost of power-loss-to-platter durability — still crash-safe, and the chainstate is reconstructible from peers. No-op on Linux/Windows, where the default sync is already a plain fsync. Default: off.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-anchor", "Run as a root-of-trust anchor/seed node: on warm boot, trust the local NEDB tip and proceed without awaiting an external Proof-of-Prefix seam. For the canonical seed(s) — which have no external peer above their tip to close the seam (and self-connections are dropped), so the seam can never close for them. Integrity still rests on content-addressed read verification, the warm-boot window, and -verifynedb. Setting this only makes THIS node trust its own local tip; it does NOT make the network trust it. Default: off.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -1718,10 +1719,17 @@ bool AppInitMain(const util::Ref& context, NodeContext& node, interfaces::BlockA
                         // rebuild scan and the node would hang on an empty
                         // chainstate. A full block-index scan + replay is the
                         // correct (and intended) path for an explicit reindex.
-                        if (!warmboot_blocked && !fReindex && !fReindexChainState) {
+                        // Warm boot is OFF by default (-warmboot to opt in). When
+                        // off we fall through to the full block-index scan below,
+                        // which links the entire index with skip pointers so
+                        // GetAncestor never triggers the on-demand ancestor crawl.
+                        const bool warmboot_enabled = gArgs.GetBoolArg("-warmboot", DEFAULT_WARM_BOOT);
+                        if (warmboot_enabled && !warmboot_blocked && !fReindex && !fReindexChainState) {
                             LOCK(cs_main);
                             warm_ok = chainman.ActiveChainstate().TryWarmBoot(
                                 *pblocktree, chainparams.GetConsensus());
+                        } else if (!warmboot_enabled) {
+                            LogPrintf("NEDB warm boot disabled by default (enable with -warmboot); performing a full block-index scan — links the whole index with skip pointers and avoids the on-demand ancestor crawl.\n");
                         }
                     }
 
