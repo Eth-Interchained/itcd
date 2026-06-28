@@ -4705,6 +4705,66 @@ bool CChainState::TryWarmBoot(CBlockTreeDB& blocktree,
     return true;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// warpSpeed: arm the Proof-of-Prefix seam over an already fully-hydrated index.
+// ─────────────────────────────────────────────────────────────────────────────
+// Warm Boot stays the correctness model; warpSpeed is the latency architecture.
+// LoadBlockIndex has already loaded the COMPLETE block index (every pprev linked,
+// every pskip built) in one sequential nedb_scan pass, so CBlockIndex::GetAncestor
+// resolves via skip pointers and never reaches a null pprev — the on-demand loader
+// (WarmBootLoadParent) can never fire, and the tip->genesis crawl is impossible.
+// This routine does NOT load anything; it only re-establishes the seam/watchdog
+// bookkeeping that confirms our persisted tip is canonical against a peer.
+bool CChainState::ArmWarmBootSeam(CBlockTreeDB& blocktree,
+                                  const Consensus::Params& params,
+                                  int64_t hydrate_ms)
+{
+    AssertLockHeld(cs_main);
+
+    // Fresh Proof-of-Prefix state for this boot.
+    g_warm_boot_verified.store(false);
+    g_warm_boot_mismatch.store(false);
+
+    uint256       tip_hash;
+    arith_uint256 tip_chainwork;
+    if (!blocktree.ReadTipHash(tip_hash) ||
+        !blocktree.ReadTipChainWork(tip_chainwork) ||
+        tip_hash.IsNull())
+    {
+        LogPrintf("warpSpeed: full header hydrate in %lld ms — no persisted tip; normal start, Proof-of-Prefix seam idle.\n",
+                  (long long)hydrate_ms);
+        return false;
+    }
+
+    BlockMap& idx = m_blockman.m_block_index;
+    auto it = idx.find(tip_hash);
+    CBlockIndex* ptip = (it != idx.end()) ? it->second : nullptr;
+
+    // The persisted tip must be a resume point whose block data is on disk. A
+    // header-only tip (e.g. one written by an older build) is not seam-able —
+    // let standard most-work consensus drive canonicity instead of asserting.
+    if (!ptip || !(ptip->nStatus & BLOCK_HAVE_DATA)) {
+        LogPrintf("warpSpeed: full header hydrate in %lld ms — persisted tip %s is not a data resume point; seam idle, normal consensus drives canonicity.\n",
+                  (long long)hydrate_ms, tip_hash.GetHex().substr(0, 16));
+        return false;
+    }
+
+    g_warm_boot_tip_hash      = tip_hash;
+    g_warm_boot_tip_height    = ptip->nHeight;
+    g_warm_boot_tip_chainwork = tip_chainwork;
+    // Full hydrate links the whole chain below the tip, so the Proof-of-Prefix
+    // base is genesis itself (not a 2016-window floor).
+    g_warm_boot_base_hash     = params.hashGenesisBlock;
+
+    LogPrintf("warpSpeed: full header hydrate complete in %lld ms — %u index entries, fully linked + skip-pointered; on-demand crawl impossible. Tip %s @ %d, chainwork %s. Proof-of-Prefix seam armed. [hydrate <3s => v1 ships as-is; 30s+ => build v2 background hydrate]\n",
+              (long long)hydrate_ms,
+              (unsigned)idx.size(),
+              tip_hash.GetHex().substr(0, 12),
+              ptip->nHeight,
+              tip_chainwork.GetHex().substr(0, 16));
+    return true;
+}
+
 // Persist the durable "tip unconfirmed" flag so the next startup full-scans from
 // height 0. Mirrors the Proof-of-Prefix watchdog (init.cpp), but callable the
 // instant a mismatch is PROVEN — net_processing acts on positive evidence without
