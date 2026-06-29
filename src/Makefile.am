@@ -403,6 +403,7 @@ libinterchained_wallet_a_SOURCES = \
   wallet/token.cpp \
   wallet/crypter.cpp \
   wallet/scriptpubkeyman.cpp \
+  ghost.cpp \
   validation.cpp \
   validationinterface.cpp \
   chain.cpp \
