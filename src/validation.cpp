@@ -4477,6 +4477,27 @@ bool WarmBootLoadParent(CBlockIndex* pindex)
         LogPrintf("WarmBootLoadParent: ReadBlockIndex failed for %s\n", pindex->phashBlock->GetHex().substr(0,16));
         return false;
     }
+
+    // If the caller's own entry is still a bare stub (nStatus == 0 — created as
+    // someone's hashPrev placeholder, e.g. the parent slot below the warm-boot
+    // window base), populate it from its record while it is in hand. Zero-field
+    // stubs linked into the chain are landmines for height math — a mid-chain
+    // nHeight==0 reads as "genesis" to any walker (this false-genesis is exactly
+    // how the first background-hydrate run completed with 0 ancestors). Every
+    // such stub eventually passes through this chokepoint, so heal them here.
+    if (pindex->nStatus == 0) {
+        pindex->nHeight        = di.nHeight;
+        pindex->nVersion       = di.nVersion;
+        pindex->hashMerkleRoot = di.hashMerkleRoot;
+        pindex->nTime          = di.nTime;
+        pindex->nBits          = di.nBits;
+        pindex->nNonce         = di.nNonce;
+        pindex->nStatus        = di.nStatus;
+        pindex->nTx            = di.nTx;
+        pindex->nChainWork     = (pindex->pprev ? pindex->pprev->nChainWork : 0)
+                                 + GetBlockProof(*pindex);
+    }
+
     if (di.hashPrev.IsNull()) {
         LogPrintf("WarmBootLoadParent: hashPrev is null (genesis?), height=%d\n", pindex->nHeight);
         return false;
@@ -4576,8 +4597,16 @@ void GhostStartBackgroundIndexHydrate()
             {
                 LOCK(cs_main);
                 for (int i = 0; i < CHUNK && walk; ++i) {
-                    if (walk->nHeight == 0) { reached_genesis = true; walk = nullptr; break; }
-                    if (walk->pprev) { walk = walk->pprev; continue; }   // already linked
+                    // Genuine genesis = height 0 AND populated. A bare stub
+                    // (nStatus == 0) also carries nHeight == 0 — the warm-boot
+                    // window base's parent placeholder is exactly such a stub,
+                    // and treating it as genesis is how the first run false-
+                    // completed with 0 ancestors. Stubs fall through to the
+                    // loader below, which now populates them in place.
+                    if (walk->nHeight == 0 && walk->nStatus != 0) {
+                        reached_genesis = true; walk = nullptr; break;
+                    }
+                    if (walk->nStatus != 0 && walk->pprev) { walk = walk->pprev; continue; }   // already linked + populated
                     if (!WarmBootLoadParent(walk)) {
                         LogPrintf("[GHOST] background hydrate: demand-load failed at height %d — stopping; the on-demand path still covers correctness.\n",
                                   walk->nHeight);
