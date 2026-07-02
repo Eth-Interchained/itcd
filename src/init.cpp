@@ -231,6 +231,10 @@ void Shutdown(NodeContext& node)
     // CScheduler/checkqueue, threadGroup and load block thread.
     if (node.scheduler) node.scheduler->stop();
     if (g_load_block.joinable()) g_load_block.join();
+    // Ghost background hydrate: exits within one chunk of ShutdownRequested()
+    // flipping; join BEFORE chainstate teardown (it walks the block index under
+    // cs_main). Safe no-op when it never started.
+    GhostJoinBackgroundIndexHydrate();
     threadGroup.interrupt_all();
     threadGroup.join_all();
 
@@ -1808,6 +1812,14 @@ bool AppInitMain(const util::Ref& context, NodeContext& node, interfaces::BlockA
                                 GhostReadiness::Get().Advance(GhostState::AnchorPending);
                                 LogPrintf("[GHOST] INSTANT BOOT: window + persisted tip loaded. Node coming up RESTRICTED, awaiting Proof-of-Prefix confirmation from a peer; deep history demand-loads via the seam; full index hydrate + wallet reconcile are the background follow-up.\n");
                             }
+                            // The background follow-up, delivered: proactively run
+                            // the tip->genesis walk on its own thread (chunked
+                            // cs_main) instead of leaving the full hydrate to
+                            // whichever GetAncestor caller trips over it first.
+                            // On seek-bound media that synchronous crawl was the
+                            // whole slow-boot symptom; the demand path stays armed
+                            // for anything the walk hasn't reached yet.
+                            GhostStartBackgroundIndexHydrate();
                         }
                     } else {
                         // warpSpeed v1 — full header hydrate (DEFAULT path).
