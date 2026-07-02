@@ -132,4 +132,21 @@ HydrateResult    RequireHydratedThroughHeight(int height, GhostAccessPolicy poli
 //! no blocking, no hydrate — for callers that already tolerate a null answer.
 CBlockIndex*     LookupBlockIndexGhostAware(const uint256& hash);
 
+// ── Background index hydrate ─────────────────────────────────────────────────
+// Runs the tip->genesis demand-load walk on a dedicated thread in chunked
+// cs_main holds, so the block index fills in the background instead of on some
+// caller's critical path. Uses the SAME chokepoint (WarmBootLoadParent) and the
+// SAME map as the on-demand path — the two cooperate under cs_main; whoever
+// loads a parent first wins and the other skips it for free. Advances
+// IndexHydrating -> IndexReady and sets HydratedThrough(tip) on completion.
+// Implemented in validation.cpp (needs cs_main / chainman internals).
+
+//! Spawn the hydrate thread. No-op unless ghost is enabled and restricted, or
+//! if the thread is already running. Call once after the INSTANT BOOT window.
+void GhostStartBackgroundIndexHydrate();
+
+//! Join the hydrate thread on shutdown (it exits within one chunk of
+//! ShutdownRequested() flipping). Safe to call when it never started.
+void GhostJoinBackgroundIndexHydrate();
+
 #endif // BITCOIN_GHOST_H

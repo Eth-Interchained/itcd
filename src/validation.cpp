@@ -54,7 +54,9 @@
 #include <script/standard.h>
 #include <key_io.h>
 
+#include <chrono>
 #include <string>
+#include <thread>
 
 #include <boost/algorithm/string/replace.hpp>
 
@@ -4454,11 +4456,48 @@ bool WarmBootLoadParent(CBlockIndex* pindex)
     if (!pindex->phashBlock)  { LogPrintf("WarmBootLoadParent: phashBlock is null\n");  return false; }
 
     // Read this block's stored entry to get its parent hash.
+    //
+    // Descending-walk memo: the walk visits child -> parent -> grandparent...;
+    // the record read to POPULATE the parent in step N is exactly the record
+    // step N+1 re-reads as "the child" just to learn ITS hashPrev. That re-read
+    // doubled the NEDB point reads of every walk (2 per ancestor) — on
+    // seek-bound media (HDD/Fusion iMacs, ~100 IOPS) it doubled the wall-clock
+    // of the whole hydrate. One-entry memo keyed by exact hash; correctness
+    // never depends on it (miss -> normal read; hashPrev is part of the header
+    // and therefore immutable for a given hash). Guarded by cs_main (asserted
+    // above), so plain statics are safe.
+    static uint256 g_wb_memo_hash;
+    static CDiskBlockIndex g_wb_memo_di;
+    static bool g_wb_memo_valid{false};
+
     CDiskBlockIndex di;
-    if (!pblocktree->ReadBlockIndex(*pindex->phashBlock, di)) {
+    if (g_wb_memo_valid && g_wb_memo_hash == *pindex->phashBlock) {
+        di = g_wb_memo_di;   // memo hit — the child re-read is skipped entirely
+    } else if (!pblocktree->ReadBlockIndex(*pindex->phashBlock, di)) {
         LogPrintf("WarmBootLoadParent: ReadBlockIndex failed for %s\n", pindex->phashBlock->GetHex().substr(0,16));
         return false;
     }
+
+    // If the caller's own entry is still a bare stub (nStatus == 0 — created as
+    // someone's hashPrev placeholder, e.g. the parent slot below the warm-boot
+    // window base), populate it from its record while it is in hand. Zero-field
+    // stubs linked into the chain are landmines for height math — a mid-chain
+    // nHeight==0 reads as "genesis" to any walker (this false-genesis is exactly
+    // how the first background-hydrate run completed with 0 ancestors). Every
+    // such stub eventually passes through this chokepoint, so heal them here.
+    if (pindex->nStatus == 0) {
+        pindex->nHeight        = di.nHeight;
+        pindex->nVersion       = di.nVersion;
+        pindex->hashMerkleRoot = di.hashMerkleRoot;
+        pindex->nTime          = di.nTime;
+        pindex->nBits          = di.nBits;
+        pindex->nNonce         = di.nNonce;
+        pindex->nStatus        = di.nStatus;
+        pindex->nTx            = di.nTx;
+        pindex->nChainWork     = (pindex->pprev ? pindex->pprev->nChainWork : 0)
+                                 + GetBlockProof(*pindex);
+    }
+
     if (di.hashPrev.IsNull()) {
         LogPrintf("WarmBootLoadParent: hashPrev is null (genesis?), height=%d\n", pindex->nHeight);
         return false;
@@ -4493,6 +4532,12 @@ bool WarmBootLoadParent(CBlockIndex* pindex)
                                  + GetBlockProof(*parent);
         // parent->pprev loaded on demand if GetAncestor walks further.
 
+        // Stash the parent's record for the next step of the descending walk —
+        // it becomes that step's "child", and the memo saves its re-read.
+        g_wb_memo_hash  = di.hashPrev;
+        g_wb_memo_di    = pdi;
+        g_wb_memo_valid = true;
+
         uint64_t n = ++g_warm_boot_demand_loads;
         if (n == 1 || n % 500 == 0)
             LogPrintf("WarmBoot: demand-loaded %llu ancestor(s) from NEDB (latest height %d)\n",
@@ -4501,6 +4546,107 @@ bool WarmBootLoadParent(CBlockIndex* pindex)
 
     pindex->pprev = parent;
     return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Ghost Protocol — background index hydrate (declared in ghost.h)
+//
+// The demand loader above IS ghost's hydrate engine; before this thread existed
+// it only ever ran SYNCHRONOUSLY inside whatever GetAncestor call happened to
+// need a deep parent — the full tip->genesis walk executed on the caller's
+// critical path (msghand, validation), one ancestor at a time. This thread runs
+// the exact same walk through the exact same chokepoint, proactively and in
+// chunked cs_main holds, so the index fills in the background while the
+// restricted node serves. No new read paths, no new storage APIs — the
+// IndexHydrating/IndexReady states and HydratedThrough() were designed for
+// precisely this and are wired here for the first time.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static std::thread g_ghost_hydrate_thread;
+
+void GhostStartBackgroundIndexHydrate()
+{
+    if (!GhostReadiness::Get().Enabled() || !GhostReadiness::Get().Restricted()) return;
+    if (g_ghost_hydrate_thread.joinable()) return; // already running
+
+    g_ghost_hydrate_thread = std::thread([] {
+      try {
+        GhostReadiness::Get().Advance(GhostState::IndexHydrating);
+        LogPrintf("[GHOST] background index hydrate: walking tip -> genesis through the demand-load chokepoint (chunked; node keeps serving)...\n");
+
+        const int64_t t0 = GetTimeMillis();
+        uint64_t hydrated = 0;
+        bool reached_genesis = false;
+        CBlockIndex* walk = nullptr;
+        {
+            LOCK(cs_main);
+            walk = ::ChainActive().Tip();
+        }
+        if (!walk) {
+            LogPrintf("[GHOST] background hydrate: no active tip — nothing to do.\n");
+            return;
+        }
+
+        // Chunked descent: hold cs_main for at most CHUNK parent loads, then
+        // release and breathe so msghand / RPC / the demand path never starve.
+        // If another thread demand-loads a parent first, walk->pprev is already
+        // set and we skip it for free — the two hydrate paths cooperate through
+        // the same map under the same lock.
+        constexpr int CHUNK = 256;
+        while (walk && !ShutdownRequested()) {
+            {
+                LOCK(cs_main);
+                for (int i = 0; i < CHUNK && walk; ++i) {
+                    // Genuine genesis = height 0 AND populated. A bare stub
+                    // (nStatus == 0) also carries nHeight == 0 — the warm-boot
+                    // window base's parent placeholder is exactly such a stub,
+                    // and treating it as genesis is how the first run false-
+                    // completed with 0 ancestors. Stubs fall through to the
+                    // loader below, which now populates them in place.
+                    if (walk->nHeight == 0 && walk->nStatus != 0) {
+                        reached_genesis = true; walk = nullptr; break;
+                    }
+                    if (walk->nStatus != 0 && walk->pprev) { walk = walk->pprev; continue; }   // already linked + populated
+                    if (!WarmBootLoadParent(walk)) {
+                        LogPrintf("[GHOST] background hydrate: demand-load failed at height %d — stopping; the on-demand path still covers correctness.\n",
+                                  walk->nHeight);
+                        walk = nullptr;
+                        break;
+                    }
+                    ++hydrated;
+                    walk = walk->pprev;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        if (reached_genesis && !ShutdownRequested()) {
+            int tip_h = -1;
+            {
+                LOCK(cs_main);
+                tip_h = ::ChainActive().Height();
+            }
+            GhostReadiness::Get().SetHydratedThrough(tip_h);
+            GhostReadiness::Get().Advance(GhostState::IndexReady);
+            const double secs = (GetTimeMillis() - t0) / 1000.0;
+            LogPrintf("[GHOST] background index hydrate COMPLETE — %llu ancestor(s) in %.1fs (%.0f/s). Index linked tip -> genesis; deep GetAncestor is now in-memory. HydratedThrough=%d.\n",
+                      (unsigned long long)hydrated, secs,
+                      secs > 0.0 ? hydrated / secs : 0.0, tip_h);
+        } else if (!reached_genesis) {
+            LogPrintf("[GHOST] background index hydrate stopped early (%llu ancestor(s) hydrated) — demand path remains armed.\n",
+                      (unsigned long long)hydrated);
+        }
+      } catch (const std::exception& e) {
+        // Never let a background optimization take the daemon down: log and
+        // leave the on-demand path armed — it covers correctness by itself.
+        LogPrintf("[GHOST] background index hydrate aborted: %s (demand path remains armed)\n", e.what());
+      }
+    });
+}
+
+void GhostJoinBackgroundIndexHydrate()
+{
+    if (g_ghost_hydrate_thread.joinable()) g_ghost_hydrate_thread.join();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
